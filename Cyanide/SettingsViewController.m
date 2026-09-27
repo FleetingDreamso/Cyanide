@@ -5609,6 +5609,12 @@ static void settings_apply_axonlite_once_async(const char *reason)
 void settings_application_did_enter_background(void)
 {
     if (__sync_lock_test_and_set(&g_app_in_background, 1)) return;
+
+    // Make the live log panic-durable up to this point (cheap; every line is
+    // already fflush'd, this adds the media sync). Do it before the early-return
+    // guards so a backgrounding always flushes.
+    log_live_flush();
+
     if (settings_cleanup_in_progress()) return;
 
     // KRW background survival. Under UIScene lifecycle the AppDelegate's
@@ -8451,9 +8457,10 @@ static NSString *pm_chip_name(NSString *machine) {
                     [self presentViewController:err animated:YES completion:nil];
                     return;
                 }
-                // Verify termination after a moment and say so honestly instead
-                // of silently leaving it in the list.
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                // Verify termination after a short moment and say so honestly
+                // instead of silently leaving it in the list. Kept short so the
+                // row disappears quickly after a successful kill.
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                                dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                     BOOL alive = procmgr_pid_alive(pid);
                     dispatch_async(dispatch_get_main_queue(), ^{

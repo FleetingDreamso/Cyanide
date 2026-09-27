@@ -29,6 +29,11 @@ void log_session_begin(void);
 void log_session_end(void);
 void log_session_flush(void);  // flush + fsync, keep file open for background tail
 
+// Force the always-open live log (<Documents>/live.log) to media. Every line is
+// already fflush()'d (survives a normal close); call this to also make it
+// panic-durable up to now (e.g. on app backgrounding). Safe to call anytime.
+void log_live_flush(void);
+
 // Absolute path of the most recent session log file, or nil if none exist.
 NSString * _Nullable log_most_recent_session_path(void);
 

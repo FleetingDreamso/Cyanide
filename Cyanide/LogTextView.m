@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/utsname.h>
 #include <time.h>
@@ -41,6 +42,80 @@ static FILE *log_file                = NULL;
 #define LOG_FSYNC_INTERVAL_NS 50000000ULL
 static uint64_t log_last_fsync_ns = 0;
 static char  log_file_path_c[1024]   = {0};
+
+// Always-open "live" log. The chain-session file (log_file) only exists during
+// an exploit run, so everything logged OUTSIDE a run -- KRW park/reattach
+// churn during scrolling, the errors that precede a surprise re-arm -- went
+// only to the in-memory ring buffer and was lost on close or panic. The live
+// log captures every line to <Documents>/live.log continuously.
+//
+// Durability without the disk-writes resource kill (see the F_FULLFSYNC note on
+// the session path and the 1 GB diskwrites report): every line is fflush()'d,
+// which is enough to survive a normal close / jetsam / resource kill (the bytes
+// sit in the OS buffer cache and reach the file even though the process dies).
+// F_FULLFSYNC -- the expensive, media-durable, panic-surviving one -- runs only
+// when NO chain session is already covering this window (during a run the chain
+// file's own 50 ms fsync provides it) and is throttled to 1 s so a burst of
+// lines can't amplify into gigabytes of journal writes.
+#define LIVE_LOG_MAX_BYTES        (4 * 1024 * 1024)
+#define LIVE_LOG_FSYNC_INTERVAL_NS 1000000000ULL
+static FILE     *live_log_file        = NULL;
+static char      live_log_path_c[1024] = {0};
+static uint64_t  live_last_fsync_ns   = 0;
+
+static NSURL *log_session_dir_url(void);   // defined below
+
+// Open (append) the live log, computing its path once and rotating a single
+// backup when it grows past the cap. Caller must hold log_mutex.
+static void live_log_open_if_needed(void) {
+    if (live_log_file) return;
+    if (live_log_path_c[0] == '\0') {
+        @autoreleasepool {
+            NSURL *dir = log_session_dir_url();
+            if (!dir) return;
+            NSURL *url = [dir URLByAppendingPathComponent:@"live.log"];
+            strlcpy(live_log_path_c, url.path.fileSystemRepresentation, sizeof(live_log_path_c));
+        }
+    }
+    if (live_log_path_c[0] == '\0') return;
+
+    struct stat st;
+    if (stat(live_log_path_c, &st) == 0 && st.st_size > LIVE_LOG_MAX_BYTES) {
+        char bak[1100];
+        snprintf(bak, sizeof(bak), "%s.1", live_log_path_c);
+        rename(live_log_path_c, bak);   // keep exactly one previous file
+    }
+    live_log_file = fopen(live_log_path_c, "a");
+    if (live_log_file) {
+        time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
+        fprintf(live_log_file,
+                "\n# --- Cyanide live log opened %04d-%02d-%02d %02d:%02d:%02d ---\n",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                tm.tm_hour, tm.tm_min, tm.tm_sec);
+        fflush(live_log_file);
+    }
+}
+
+// Append one already-stamped line to the live log. Caller must hold log_mutex.
+// sessionActive == (log_file != NULL): when true we skip F_FULLFSYNC here
+// because the chain file is already fsyncing this window.
+static void live_log_append(const char *stamped_line, bool sessionActive) {
+    live_log_open_if_needed();
+    if (!live_log_file) return;
+    fprintf(live_log_file, "%s\n", stamped_line);
+    fflush(live_log_file);   // survives close / jetsam / resource kill
+    if (!sessionActive) {
+        uint64_t nowNS = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        if (nowNS - live_last_fsync_ns >= LIVE_LOG_FSYNC_INTERVAL_NS) {
+            fcntl(fileno(live_log_file), F_FULLFSYNC, 0);   // panic-durable
+            live_last_fsync_ns = nowNS;
+        }
+    }
+    if (ftello(live_log_file) > LIVE_LOG_MAX_BYTES) {
+        fclose(live_log_file);
+        live_log_file = NULL;   // reopened (with rotation) on the next line
+    }
+}
 
 void log_init(void) {
     pthread_mutex_lock(&log_mutex);
@@ -112,6 +187,12 @@ static void log_write_raw_internal(const char *msg, int skipTimestamp) {
                     log_last_fsync_ns = nowNS;
                 }
             }
+
+            // Always mirror to the persistent live log so lines produced outside
+            // a chain session (KRW park/reattach during scrolling) survive close
+            // and panic, not just the in-memory ring buffer.
+            if (stamped_line[0])
+                live_log_append(stamped_line, log_file != NULL);
 
             line_pos  = 0;
         } else {
@@ -341,6 +422,20 @@ void log_session_flush(void) {
         fflush(log_file);
         fcntl(fileno(log_file), F_FULLFSYNC, 0);
         log_last_fsync_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    }
+    pthread_mutex_unlock(&log_mutex);
+}
+
+// Force the live log all the way to media. fflush already makes each line
+// survive a normal close, but a kernel panic loses the buffer cache; call this
+// at moments worth a guaranteed flush (app backgrounding, terminal cleanup) so
+// the live log is panic-durable up to that point without a per-line F_FULLFSYNC.
+void log_live_flush(void) {
+    pthread_mutex_lock(&log_mutex);
+    if (live_log_file) {
+        fflush(live_log_file);
+        fcntl(fileno(live_log_file), F_FULLFSYNC, 0);
+        live_last_fsync_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     }
     pthread_mutex_unlock(&log_mutex);
 }
