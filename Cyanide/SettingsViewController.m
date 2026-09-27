@@ -33,9 +33,17 @@
 
 #import <objc/runtime.h>
 #import <sys/time.h>
+#import <sys/sysctl.h>
+#import <signal.h>
+#import <errno.h>
+#import <mach/mach.h>
+#import <mach/mach_host.h>
+#import <mach/host_info.h>
 #import "DSKeepAlive.h"
 #import "TaskRop/RemoteCall.h"
 #import "kexploit/kutils.h"
+#import "utils/process.h"
+#import "LogViewController.h"
 #import "kexploit/persistence.h"
 #import "kexploit/machine_info.h"
 #import "tweaks/remote_objc.h"
@@ -44,6 +52,7 @@
 #import "installer/Package.h"
 #import "installer/PackageCatalog.h"
 #import "installer/PackageQueue.h"
+#import "installer/MainTabBarController.h"
 #import "docs/DocsViewController.h"
 #import "UpdateChecker.h"
 #import "SBLArchiveExtractor.h"
@@ -7700,6 +7709,726 @@ static _CyanideMailDelegate *_cyanide_mail_delegate(void) {
     return d;
 }
 
+#pragma mark - Process Manager
+
+typedef NS_ENUM(NSInteger, PMSortKey) { PMSortPID = 0, PMSortCPU, PMSortMem, PMSortName };
+
+// Columned row: name + PID on the left, CPU% and memory right-aligned so they line
+// up and read as sortable columns.
+@interface PMProcCell : UITableViewCell
+@property (nonatomic, strong) UILabel *nameL, *pidL, *cpuL, *memL;
+@end
+
+@implementation PMProcCell
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)rid
+{
+    self = [super initWithStyle:UITableViewCellStyleDefault reuseIdentifier:rid];
+    if (self) {
+        _nameL = [UILabel new]; _nameL.font = [UIFont systemFontOfSize:15];
+        _pidL  = [UILabel new]; _pidL.font  = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+        _pidL.textColor = [UIColor secondaryLabelColor];
+        _cpuL  = [UILabel new]; _cpuL.font  = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+        _cpuL.textAlignment = NSTextAlignmentRight;
+        _memL  = [UILabel new]; _memL.font  = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+        _memL.textAlignment = NSTextAlignmentRight; _memL.textColor = [UIColor secondaryLabelColor];
+        for (UILabel *l in @[_nameL, _pidL, _cpuL, _memL]) [self.contentView addSubview:l];
+    }
+    return self;
+}
+- (void)layoutSubviews
+{
+    [super layoutSubviews];
+    CGFloat W = self.contentView.bounds.size.width, H = self.contentView.bounds.size.height;
+    CGFloat pad = 16, memW = 82, cpuW = 58, gap = 10;
+    CGFloat memX = W - pad - memW, cpuX = memX - gap - cpuW;
+    _memL.frame = CGRectMake(memX, 0, memW, H);
+    _cpuL.frame = CGRectMake(cpuX, 0, cpuW, H);
+    CGFloat nameW = cpuX - gap - pad;
+    _nameL.frame = CGRectMake(pad, 5,  nameW, 19);
+    _pidL.frame  = CGRectMake(pad, 25, nameW, 13);
+}
+@end
+
+// A live process viewer: lists every process by walking the kernel proc list via
+// KRW, reads CPU/memory read-only from kernel structs (self-calibrated), sorts by
+// any column, and can force-quit. Needs kernel r/w armed — a Run this session.
+@interface ProcessManagerViewController : UITableViewController <UISearchResultsUpdating>
+@property (nonatomic, strong) NSArray<NSDictionary *> *allProcs;   // full snapshot
+@property (nonatomic, strong) NSArray<NSDictionary *> *procs;      // filtered / shown
+@property (nonatomic, copy)   NSString *filter;
+@property (nonatomic, assign) BOOL krwReady;
+@property (nonatomic, assign) BOOL arming;
+@property (nonatomic, assign) BOOL statsAvailable;
+@property (nonatomic, assign) PMSortKey sortKey;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *prevCpu;  // pid -> cumulative cpu ns
+@property (nonatomic, assign) uint64_t prevWall;                                     // ns
+@property (nonatomic, strong) UISearchController *searchCtrl;
+@property (nonatomic, strong) NSTimer *autoRefreshTimer;
+// Summary header (system memory / overall CPU / chip) above the list.
+@property (nonatomic, strong) UILabel *pmHdrChip;
+@property (nonatomic, strong) UILabel *pmHdrMem;
+@property (nonatomic, strong) UILabel *pmHdrCpu;
+@property (nonatomic, assign) uint64_t prevCpuBusyTicks;
+@property (nonatomic, assign) uint64_t prevCpuTotalTicks;
+@property (nonatomic, assign) BOOL havePrevCpuTicks;
+@end
+
+static NSString * const kProcMgrAutoRefreshSecondsKey = @"procmgrAutoRefreshSeconds";
+
+@implementation ProcessManagerViewController
+
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    self.title = @"Process Viewer";
+    self.allProcs = @[];
+    self.procs = @[];
+    self.filter = @"";
+    self.prevCpu = [NSMutableDictionary dictionary];
+    UIBarButtonItem *refreshItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
+                                                      target:self
+                                                      action:@selector(reloadProcs)];
+    UIBarButtonItem *timerItem =
+        [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"timer"]
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(showAutoRefreshOptions:)];
+    self.navigationItem.rightBarButtonItems = @[refreshItem, timerItem];
+    self.refreshControl = [[UIRefreshControl alloc] init];
+    [self.refreshControl addTarget:self action:@selector(reloadProcs)
+                  forControlEvents:UIControlEventValueChanged];
+
+    self.searchCtrl = [[UISearchController alloc] initWithSearchResultsController:nil];
+    self.searchCtrl.searchResultsUpdater = self;
+    self.searchCtrl.obscuresBackgroundDuringPresentation = NO;
+    self.searchCtrl.searchBar.placeholder = @"Filter by name or PID";
+    self.navigationItem.searchController = self.searchCtrl;
+    self.navigationItem.hidesSearchBarWhenScrolling = NO;
+    self.definesPresentationContext = YES;
+    // Keep a stable large title; the sort control lives in the header (putting a
+    // titleView here fought the large title and made it jump/hide on push).
+    self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeAlways;
+
+    [self buildSummaryHeader];
+    [self reloadProcs];
+}
+
+// --- summary header: live system info above the process list -----------------
+
+static NSInteger pm_sysctl_int(const char *name) {
+    int v = 0; size_t s = sizeof(v);
+    return sysctlbyname(name, &v, &s, NULL, 0) == 0 ? (NSInteger)v : -1;
+}
+
+// Map hw.machine IDs to marketing chip names; fallback is the raw string.
+static NSString *pm_chip_name(NSString *machine) {
+    static NSDictionary<NSString *, NSString *> *chips = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        chips = @{
+            @"iPhone16,1": @"A17 Pro", @"iPhone16,2": @"A17 Pro",
+            @"iPhone17,1": @"A18 Pro", @"iPhone17,2": @"A18 Pro",
+            @"iPhone17,3": @"A18",     @"iPhone17,4": @"A18",
+        };
+    });
+    NSString *c = chips[machine];
+    if (c) return c;
+    if ([machine hasPrefix:@"iPhone18,"]) return @"A19 family";
+    return machine;
+}
+
+- (NSString *)chipSummaryString
+{
+    char machine[64] = {0};
+    size_t len = sizeof(machine);
+    NSString *m = @"Unknown";
+    if (sysctlbyname("hw.machine", machine, &len, NULL, 0) == 0 && machine[0])
+        m = [NSString stringWithUTF8String:machine];
+    NSString *chip = pm_chip_name(m);
+
+    NSInteger ncpu = pm_sysctl_int("hw.ncpu");
+    NSInteger phys = pm_sysctl_int("hw.physicalcpu");
+    NSInteger cores = phys > 0 ? phys : ncpu;
+    if (cores <= 0) return chip;
+
+    NSInteger nperf = pm_sysctl_int("hw.nperflevels");
+    NSInteger pCores = pm_sysctl_int("hw.perflevel0.physicalcpu");
+    NSInteger eCores = pm_sysctl_int("hw.perflevel1.physicalcpu");
+    if (nperf >= 2 && pCores > 0 && eCores > 0)
+        return [NSString stringWithFormat:@"%@ · %ld cores (%ldP+%ldE)",
+                chip, (long)cores, (long)pCores, (long)eCores];
+    return [NSString stringWithFormat:@"%@ · %ld cores", chip, (long)cores];
+}
+
+- (void)buildSummaryHeader
+{
+    const CGFloat H = 112, pad = 16;
+    // Width may still be 0 in viewDidLoad — labels therefore use Auto Layout
+    // pinned to the header, and viewDidLayoutSubviews keeps the header's frame
+    // matched to the table's real width (tableHeaderView width isn't managed
+    // automatically).
+    UIView *hdr = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.tableView.bounds.size.width, H)];
+    UILabel *(^mk)(CGFloat, CGFloat) = ^UILabel *(CGFloat y, CGFloat size) {
+        UILabel *l = [UILabel new];
+        l.font = [UIFont systemFontOfSize:size];
+        l.textColor = [UIColor secondaryLabelColor];
+        l.adjustsFontSizeToFitWidth = NO;
+        l.translatesAutoresizingMaskIntoConstraints = NO;
+        [hdr addSubview:l];
+        [NSLayoutConstraint activateConstraints:@[
+            [l.leadingAnchor constraintEqualToAnchor:hdr.leadingAnchor constant:pad],
+            [l.trailingAnchor constraintEqualToAnchor:hdr.trailingAnchor constant:-pad],
+            [l.topAnchor constraintEqualToAnchor:hdr.topAnchor constant:y],
+        ]];
+        return l;
+    };
+    self.pmHdrChip = mk(8, 13);
+    self.pmHdrMem  = mk(27, 12);
+    self.pmHdrCpu  = mk(45, 12);
+    self.pmHdrChip.text = [self chipSummaryString];
+    self.pmHdrMem.text = @"Memory: —";
+    self.pmHdrCpu.text = @"CPU: —";
+
+    // Sort control lives in the header (not a nav titleView, which fought the
+    // large title). Always visible above the list.
+    UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"PID", @"CPU", @"Mem", @"Name"]];
+    seg.selectedSegmentIndex = self.sortKey;
+    seg.translatesAutoresizingMaskIntoConstraints = NO;
+    [seg addTarget:self action:@selector(sortChanged:) forControlEvents:UIControlEventValueChanged];
+    [hdr addSubview:seg];
+    [NSLayoutConstraint activateConstraints:@[
+        [seg.leadingAnchor  constraintEqualToAnchor:hdr.leadingAnchor constant:pad],
+        [seg.trailingAnchor constraintEqualToAnchor:hdr.trailingAnchor constant:-pad],
+        [seg.topAnchor      constraintEqualToAnchor:hdr.topAnchor constant:70],
+        [seg.heightAnchor   constraintEqualToConstant:30],
+    ]];
+
+    self.tableView.tableHeaderView = hdr;
+}
+
+- (void)viewDidLayoutSubviews
+{
+    [super viewDidLayoutSubviews];
+    // Track the table's actual width (rotation, split view, late layout).
+    UIView *hdr = self.tableView.tableHeaderView;
+    CGFloat w = self.tableView.bounds.size.width;
+    if (hdr && w > 0 && hdr.frame.size.width != w) {
+        hdr.frame = CGRectMake(0, 0, w, hdr.frame.size.height);
+        self.tableView.tableHeaderView = hdr;   // re-assign to force relayout
+    }
+}
+
+- (void)updateSummaryHeader
+{
+    static NSByteCountFormatter *fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [NSByteCountFormatter new];
+        fmt.countStyle = NSByteCountFormatterCountStyleMemory;
+        fmt.includesUnit = YES;
+    });
+
+    // Memory: used = total − free (simple definition).
+    uint64_t total = [NSProcessInfo processInfo].physicalMemory;
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm, &cnt) == KERN_SUCCESS) {
+        uint64_t freeB = (uint64_t)vm.free_count * (uint64_t)vm_page_size;
+        uint64_t usedB = total > freeB ? total - freeB : 0;
+        self.pmHdrMem.text = [NSString stringWithFormat:@"Memory: %@ used / %@ total (%@ free)",
+            [fmt stringFromByteCount:(long long)usedB],
+            [fmt stringFromByteCount:(long long)total],
+            [fmt stringFromByteCount:(long long)freeB]];
+    }
+
+    // Overall CPU: busy fraction delta of cumulative host cpu_ticks.
+    host_cpu_load_info_data_t cl;
+    cnt = HOST_CPU_LOAD_INFO_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_CPU_LOAD_INFO,
+                          (host_info64_t)&cl, &cnt) == KERN_SUCCESS) {
+        uint64_t busy = (uint64_t)cl.cpu_ticks[CPU_STATE_USER]
+                      + (uint64_t)cl.cpu_ticks[CPU_STATE_SYSTEM]
+                      + (uint64_t)cl.cpu_ticks[CPU_STATE_NICE];
+        uint64_t all  = busy + (uint64_t)cl.cpu_ticks[CPU_STATE_IDLE];
+        if (self.havePrevCpuTicks && all > self.prevCpuTotalTicks) {
+            double pct = 100.0 * (double)(busy - self.prevCpuBusyTicks)
+                               / (double)(all - self.prevCpuTotalTicks);
+            self.pmHdrCpu.text = [NSString stringWithFormat:@"CPU: %.1f%% busy", pct];
+        } else {
+            self.pmHdrCpu.text = @"CPU: —";
+        }
+        self.prevCpuBusyTicks = busy;
+        self.prevCpuTotalTicks = all;
+        self.havePrevCpuTicks = YES;
+    }
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    // The queue popup bar is hosted by the tab bar controller, above pushed
+    // content — suppress it while this screen is on top.
+    UITabBarController *tbc = self.tabBarController;
+    if ([tbc isKindOfClass:MainTabBarController.class]) {
+        [(MainTabBarController *)tbc setPopupBarSuppressed:YES];
+    }
+    [self startAutoRefreshTimerIfNeeded];
+
+    // Auto-arm on open: armKRW tries the parked-primitive restore first (safe,
+    // no confirmation) and only asks before running the full exploit.
+    if (!self.krwReady && !self.arming) [self armKRW];
+}
+
+- (void)viewWillDisappear:(BOOL)animated
+{
+    [super viewWillDisappear:animated];
+    UITabBarController *tbc = self.tabBarController;
+    if ([tbc isKindOfClass:MainTabBarController.class]) {
+        [(MainTabBarController *)tbc setPopupBarSuppressed:NO];
+    }
+    [self stopAutoRefreshTimer];
+}
+
+- (void)dealloc
+{
+    [self stopAutoRefreshTimer];
+}
+
+#pragma mark Auto Refresh
+
+- (double)autoRefreshInterval
+{
+    return [NSUserDefaults.standardUserDefaults doubleForKey:kProcMgrAutoRefreshSecondsKey];
+}
+
+- (void)startAutoRefreshTimerIfNeeded
+{
+    [self stopAutoRefreshTimer];   // never stack timers
+    double interval = [self autoRefreshInterval];
+    if (interval <= 0) return;
+    self.autoRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:interval
+                                                             target:self
+                                                           selector:@selector(reloadProcs)
+                                                           userInfo:nil
+                                                            repeats:YES];
+}
+
+- (void)stopAutoRefreshTimer
+{
+    [self.autoRefreshTimer invalidate];
+    self.autoRefreshTimer = nil;
+}
+
+- (void)showAutoRefreshOptions:(UIBarButtonItem *)sender
+{
+    NSArray<NSNumber *> *options = @[ @0, @1, @2, @5, @10 ];
+    double current = [self autoRefreshInterval];
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"Auto Refresh"
+                         message:@"How often should the process list refresh itself?"
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+
+    for (NSNumber *opt in options) {
+        double seconds = opt.doubleValue;
+        NSString *title = (seconds <= 0) ? @"Off"
+                                         : [NSString stringWithFormat:@"Every %d second%@", (int)seconds,
+                                            ((int)seconds == 1) ? @"" : @"s"];
+        if (seconds == current) title = [title stringByAppendingString:@" ✓"];
+        [ac addAction:[UIAlertAction actionWithTitle:title
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            [NSUserDefaults.standardUserDefaults setDouble:seconds forKey:kProcMgrAutoRefreshSecondsKey];
+            [self startAutoRefreshTimerIfNeeded];
+        }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    ac.popoverPresentationController.barButtonItem = sender;
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)sortChanged:(UISegmentedControl *)seg
+{
+    self.sortKey = (PMSortKey)seg.selectedSegmentIndex;
+    [self applyFilter];
+}
+
+- (void)reloadProcs
+{
+    if (!kexploit_krw_ready()) {
+        self.krwReady = NO;
+        self.allProcs = @[];
+        self.procs = @[];
+        [self.tableView reloadData];
+        [self.refreshControl endRefreshing];
+        self.navigationItem.prompt = nil;
+        [self updateSummaryHeader];
+        return;
+    }
+    self.krwReady = YES;
+
+    // Enumerate via the KRW proc-walk, then read each process's memory/CPU from
+    // the kernel task/thread structs using the self-calibrated, mapped-checked
+    // read path (procmgr_stats). All read-only — no writes, no escalation — so
+    // none of the 18.x write mitigations apply, and every dereference is gated by
+    // ksafe so an unmapped/stale pointer degrades instead of panicking. libproc is
+    // the fallback for our own (and permitted) pids. %CPU is a delta between
+    // refreshes; done on a background queue so the UI never blocks on KRW.
+    uint64_t nowNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    double dWall = (self.prevWall > 0 && nowNs > self.prevWall) ? (double)(nowNs - self.prevWall) : 0;
+    NSDictionary<NSNumber *, NSNumber *> *prevCpu = self.prevCpu;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        // Read-only route: self-calibrate the kernel-struct offsets from our own
+        // process, then read every process's memory from the kernel ledger. No
+        // writes anywhere, so none of the 18.5 write mitigations apply.
+        procmgr_calibrate();
+
+        int cap = 4096;
+        procmgr_entry_t *buf = calloc((size_t)cap, sizeof(procmgr_entry_t));
+        int n = buf ? procmgr_list(buf, cap) : -1;
+        NSMutableArray<NSDictionary *> *rows = [NSMutableArray array];
+        NSMutableDictionary<NSNumber *, NSNumber *> *newCpu = [NSMutableDictionary dictionary];
+        int statCount = 0;
+        for (int i = 0; i < n; i++) {
+            int pid = buf[i].pid;
+            NSMutableDictionary *row = [@{ @"pid": @(pid),
+                                          @"name": [NSString stringWithUTF8String:buf[i].name] } mutableCopy];
+            uint64_t mem = 0, cpu = 0;
+            if (procmgr_stats(pid, &mem, &cpu) == 0) {
+                statCount++;
+                row[@"mem"] = @(mem);
+                newCpu[@(pid)] = @(cpu);
+                NSNumber *prev = prevCpu[@(pid)];
+                if (prev && dWall > 0) {
+                    double pct = 100.0 * (double)(cpu - prev.unsignedLongLongValue) / dWall;
+                    if (pct < 0) pct = 0;
+                    if (pct > 800.0) pct = 800.0;   // clamp (multi-core)
+                    row[@"cpu"] = @(pct);
+                }
+            }
+            // Suspended/zombie rows: preloaded apps sit task-suspended and
+            // never run, so the crash-trick force-quit can't reach them.
+            // Kernel-side suspend_count is the reliable signal; libproc p_stat
+            // (PM_SSTOP/PM_SZOMB) is kept as a fallback.
+            int st = procmgr_pstat(pid);
+            if (st == PM_SSTOP || st == PM_SZOMB || procmgr_suspend_count(pid) > 0)
+                row[@"suspended"] = @YES;
+            [rows addObject:row];
+        }
+        if (buf) free(buf);
+        [rows sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [a[@"pid"] compare:b[@"pid"]];
+        }];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.prevCpu = newCpu;
+            self.prevWall = nowNs;
+            self.statsAvailable = (statCount > 0);
+            [self updateSummaryHeader];
+            self.allProcs = rows;
+            [self applyFilter];   // sets the "N processes" prompt
+            [self.refreshControl endRefreshing];
+        });
+    });
+}
+
+- (void)applyFilter
+{
+    NSString *q = [self.filter stringByTrimmingCharactersInSet:
+                   [NSCharacterSet whitespaceCharacterSet]];
+    if (q.length == 0) {
+        self.procs = self.allProcs;
+    } else {
+        NSMutableArray *out = [NSMutableArray array];
+        for (NSDictionary *p in self.allProcs) {
+            NSString *name = p[@"name"];
+            NSString *pid = [p[@"pid"] stringValue];
+            if ([name rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                [pid rangeOfString:q].location != NSNotFound) {
+                [out addObject:p];
+            }
+        }
+        self.procs = out;
+    }
+
+    PMSortKey key = self.sortKey;
+    self.procs = [self.procs sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        switch (key) {
+            case PMSortName:
+                return [a[@"name"] caseInsensitiveCompare:b[@"name"]];
+            case PMSortCPU: {   // highest first; missing values last
+                double ca = [a[@"cpu"] doubleValue], cb = [b[@"cpu"] doubleValue];
+                if (ca == cb) return [a[@"pid"] compare:b[@"pid"]];
+                return ca > cb ? NSOrderedAscending : NSOrderedDescending;
+            }
+            case PMSortMem: {   // highest first; missing values last
+                unsigned long long ma = [a[@"mem"] unsignedLongLongValue], mb = [b[@"mem"] unsignedLongLongValue];
+                if (ma == mb) return [a[@"pid"] compare:b[@"pid"]];
+                return ma > mb ? NSOrderedAscending : NSOrderedDescending;
+            }
+            case PMSortPID:
+            default:
+                return [a[@"pid"] compare:b[@"pid"]];
+        }
+    }];
+
+    self.navigationItem.prompt = (q.length == 0)
+        ? [NSString stringWithFormat:@"%lu processes", (unsigned long)self.allProcs.count]
+        : [NSString stringWithFormat:@"%lu of %lu", (unsigned long)self.procs.count,
+           (unsigned long)self.allProcs.count];
+    [self.tableView reloadData];
+}
+
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController
+{
+    self.filter = searchController.searchBar.text ?: @"";
+    if (self.krwReady) [self applyFilter];
+}
+
+#pragma mark Arming
+
+- (void)armKRW
+{
+    if (self.arming) return;
+    self.arming = YES;
+    [self.tableView reloadData];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        BOOL ok = (kexploit_opa334_recover_only() == 0) || kexploit_krw_ready();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (ok && kexploit_krw_ready()) {
+                self.arming = NO;
+                [self reloadProcs];
+                return;
+            }
+            // No parked state to recover — a full exploit is the only way, and on
+            // A18/M4 that can reboot the device. Ask before doing it.
+            UIAlertController *ac = [UIAlertController
+                alertControllerWithTitle:@"No parked kernel state"
+                                 message:@"Kernel access couldn't be restored from a parked state. Running the full exploit can reboot the device on A18/M4. Continue?"
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel
+                                                 handler:^(UIAlertAction *a) {
+                self.arming = NO; [self.tableView reloadData];
+            }]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Run Full Exploit"
+                                                   style:UIAlertActionStyleDefault
+                                                 handler:^(UIAlertAction *a) {
+                // Show the live log while the exploit runs, like a normal Run.
+                LogViewController *log = [[LogViewController alloc] init];
+                UINavigationController *lnav = [[UINavigationController alloc] initWithRootViewController:log];
+                [self presentViewController:lnav animated:YES completion:^{
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        kexploit_opa334();
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            self.arming = NO;
+                            if (self.presentedViewController == lnav) {
+                                [self dismissViewControllerAnimated:YES completion:^{ [self reloadProcs]; }];
+                            } else {
+                                [self reloadProcs];
+                            }
+                        });
+                    });
+                }];
+            }]];
+            [self presentViewController:ac animated:YES completion:nil];
+        });
+    });
+}
+
+#pragma mark Table
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
+{
+    return self.krwReady ? (NSInteger)self.procs.count : 1;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    if (!self.krwReady) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"pmarm"];
+        if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                                 reuseIdentifier:@"pmarm"];
+        cell.accessoryView = nil;
+        if (self.arming) {
+            cell.textLabel.text = @"Arming kernel access…";
+            cell.detailTextLabel.text = @"Restoring the parked primitive.";
+            cell.textLabel.textColor = [UIColor labelColor];
+            UIActivityIndicatorView *spin = [[UIActivityIndicatorView alloc]
+                initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+            [spin startAnimating];
+            cell.accessoryView = spin;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else {
+            cell.textLabel.text = @"Arm Kernel Access";
+            cell.detailTextLabel.text = @"Tap to restore kernel r/w (no tweaks re-applied).";
+            cell.textLabel.textColor = [UIColor systemBlueColor];
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        }
+        return cell;
+    }
+
+    PMProcCell *cell = [tableView dequeueReusableCellWithIdentifier:@"pmrow"];
+    if (!cell) cell = [[PMProcCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"pmrow"];
+
+    NSDictionary *p = self.procs[indexPath.row];
+    int pid = [p[@"pid"] intValue];
+    BOOL protectedPid = procmgr_pid_is_protected(pid);
+    BOOL suspended = [p[@"suspended"] boolValue];
+
+    cell.nameL.text = p[@"name"];
+    cell.nameL.textColor = suspended ? [UIColor tertiaryLabelColor]
+                           : protectedPid ? [UIColor secondaryLabelColor]
+                                          : [UIColor labelColor];
+    cell.pidL.text = suspended ? [NSString stringWithFormat:@"PID %d · suspended", pid]
+                               : [NSString stringWithFormat:@"PID %d", pid];
+
+    NSNumber *mem = p[@"mem"];
+    cell.memL.text = mem ? [NSByteCountFormatter stringFromByteCount:(long long)mem.unsignedLongLongValue
+                                                          countStyle:NSByteCountFormatterCountStyleMemory]
+                         : @"—";
+    NSNumber *cpu = p[@"cpu"];
+    cell.cpuL.text = cpu ? [NSString stringWithFormat:@"%.1f%%", cpu.doubleValue] : @"—";
+    if (suspended) {
+        cell.cpuL.textColor = [UIColor secondaryLabelColor];
+        cell.memL.textColor = [UIColor secondaryLabelColor];
+    } else {
+        cell.cpuL.textColor = (cpu && cpu.doubleValue >= 1.0) ? [UIColor labelColor]
+                                                              : [UIColor secondaryLabelColor];
+        cell.memL.textColor = [UIColor secondaryLabelColor];   // PMProcCell default
+    }
+
+    cell.selectionStyle = (protectedPid || suspended) ? UITableViewCellSelectionStyleNone
+                                                      : UITableViewCellSelectionStyleDefault;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+
+    if (!self.krwReady) {
+        if (!self.arming) [self armKRW];
+        return;
+    }
+    if (indexPath.row >= (NSInteger)self.procs.count) return;
+
+    NSDictionary *p = self.procs[indexPath.row];
+    int pid = [p[@"pid"] intValue];
+    NSString *name = p[@"name"];
+    if (procmgr_pid_is_protected(pid)) return;
+
+    // Suspended (preloaded/backgrounded) processes are never offered a force-quit:
+    // they aren't really running, and the crash-trick can't land on a thread that
+    // never resumes. Just explain and stop.
+    if ([p[@"suspended"] boolValue]) {
+        UIAlertController *info = [UIAlertController
+            alertControllerWithTitle:name
+                             message:@"This process is suspended (preloaded/backgrounded by iOS and not actually running), so it can't be force-quit."
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [info addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:info animated:YES completion:nil];
+        return;
+    }
+
+    BOOL isSystem = (pid < 100);   // low pids are core daemons — warn harder
+    NSString *msg = isSystem
+        ? [NSString stringWithFormat:@"%@ (PID %d) is a system process. Force-quitting it may respring or reboot the device.", name, pid]
+        : [NSString stringWithFormat:@"Force-quit %@ (PID %d)?", name, pid];
+
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Force Quit"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    // Clean termination via SIGTERM — only when we hold signal permission for
+    // this pid (probed with kill(pid, 0); suspended rows without permission
+    // already got the informational alert above). SIGTERM can be caught or
+    // ignored by the target, so verify like the force-quit path does.
+    BOOL canSignal = (kill(pid, 0) == 0);
+    if (canSignal) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"Quit"
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *a) {
+            if (kill(pid, SIGTERM) != 0) {
+                UIAlertController *err = [UIAlertController
+                    alertControllerWithTitle:@"Couldn't Quit"
+                                     message:[NSString stringWithFormat:@"SIGTERM failed (errno %d — the process may have already exited).", errno]
+                              preferredStyle:UIAlertControllerStyleAlert];
+                [err addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [self presentViewController:err animated:YES completion:nil];
+                return;
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                BOOL alive = procmgr_pid_alive(pid);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (alive) {
+                        UIAlertController *nope = [UIAlertController
+                            alertControllerWithTitle:@"Didn't terminate"
+                                             message:[NSString stringWithFormat:@"%@ (PID %d) is still running — it caught or ignored SIGTERM. Use Force Quit instead.", name, pid]
+                                      preferredStyle:UIAlertControllerStyleAlert];
+                        [nope addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                        [self presentViewController:nope animated:YES completion:nil];
+                    }
+                    [self reloadProcs];
+                });
+            });
+        }]];
+    }
+
+    [ac addAction:[UIAlertAction actionWithTitle:@"Force Quit"
+                                           style:UIAlertActionStyleDestructive
+                                         handler:^(UIAlertAction *a) {
+        int rc = procmgr_kill(pid);
+        if (rc != 0) {
+            NSString *msg;
+            switch (rc) {
+                case -3:
+                    msg = @"The process has already exited.";
+                    break;
+                case -6:
+                    msg = @"The system denied the force-quit signal for this process, and forcing it any other way isn't safe (it can panic the device), so it's left running.";
+                    break;
+                default:
+                    msg = [NSString stringWithFormat:@"Error %d (the process may have already exited).", rc];
+                    break;
+            }
+            UIAlertController *err = [UIAlertController
+                alertControllerWithTitle:@"Couldn't Force Quit"
+                                 message:msg
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:err animated:YES completion:nil];
+            return;
+        }
+        // Verify: the kill only lands when a thread returns to user mode, so a
+        // process idle in the kernel may survive. Check after a moment and say so
+        // honestly instead of silently leaving it in the list.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            BOOL alive = procmgr_pid_alive(pid);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (alive) {
+                    UIAlertController *nope = [UIAlertController
+                        alertControllerWithTitle:@"Didn't terminate"
+                                         message:[NSString stringWithFormat:@"%@ (PID %d) is still running — it's idle in the kernel, which force-quit can't reach without a kernel signal.", name, pid]
+                                  preferredStyle:UIAlertControllerStyleAlert];
+                    [nope addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                    [self presentViewController:nope animated:YES completion:nil];
+                }
+                [self reloadProcs];
+            });
+        });
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+@end
+
 @interface ThemerFormatGuideViewController : UITableViewController
 @end
 
@@ -9122,6 +9851,7 @@ static NSUInteger settings_tab_index_for_title(UITabBarController *tab, NSString
     return @[
         @{ @"title": @"OTA Updates",       @"icon": @"icloud.slash.fill",    @"color": [UIColor systemGrayColor],   @"section": @(SectionOTA) },
         @{ @"title": @"Watch Pairing",     @"icon": @"applewatch.radiowaves.left.and.right", @"color": [UIColor systemPurpleColor], @"section": @(SectionNanoRegistry) },
+        @{ @"title": @"Process Viewer",    @"icon": @"list.bullet.rectangle.fill", @"color": [UIColor systemGrayColor], @"section": @(-1), @"custom": @"procmgr" },
     ];
 }
 
@@ -9132,6 +9862,7 @@ static NSUInteger settings_tab_index_for_title(UITabBarController *tab, NSString
     for (NSDictionary *bundle in bundles) {
         if ([bundle[@"indev"] boolValue]) continue;
         if ([bundle[@"experimental"] boolValue] && !experimentalOn) continue;
+        if (bundle[@"custom"]) { [out addObject:bundle]; continue; }  // opens a custom screen, no config section
         NSInteger sec = [bundle[@"section"] integerValue];
         if ([self rowsForSection:sec].count > 0) {
             [out addObject:bundle];
@@ -12488,6 +13219,11 @@ void cyanide_present_contact(UIViewController *host)
                         ? self.tweakBundleRows
                         : self.systemBundleRows);
                 NSDictionary *bundle = bundles[indexPath.row];
+                if ([bundle[@"custom"] isEqualToString:@"procmgr"]) {
+                    ProcessManagerViewController *pm = [[ProcessManagerViewController alloc] initWithStyle:UITableViewStylePlain];
+                    [self.navigationController pushViewController:pm animated:YES];
+                    return;
+                }
                 NSInteger underlying = [bundle[@"section"] integerValue];
                 NSString *pushTitle = bundle[@"title"];
                 SettingsViewController *detail = [[SettingsViewController alloc] initWithUnderlyingSection:underlying

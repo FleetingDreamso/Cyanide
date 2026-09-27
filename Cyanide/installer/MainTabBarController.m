@@ -185,6 +185,13 @@ static NSString * const kSourcesLastRefreshKey = @"RepoTweaksLastRefreshTimestam
 
 #pragma mark - Popup inset propagation
 
+- (void)setPopupBarSuppressed:(BOOL)suppressed
+{
+    if (self.popupBar.suppressed == suppressed) return;
+    self.popupBar.suppressed = suppressed;
+    [self refreshChildInsetsAnimated:YES];
+}
+
 - (void)queueDidChange:(NSNotification *)note
 {
     [self refreshChildInsetsAnimated:YES];
@@ -195,7 +202,7 @@ static NSString * const kSourcesLastRefreshKey = @"RepoTweaksLastRefreshTimestam
 
 - (void)refreshChildInsetsAnimated:(BOOL)animated
 {
-    BOOL visible = [PackageQueue sharedQueue].pendingCount > 0;
+    BOOL visible = !self.popupBar.suppressed && [PackageQueue sharedQueue].pendingCount > 0;
     UIEdgeInsets insets = UIEdgeInsetsZero;
     if (visible) {
         insets.bottom = kPopupHeight + kPopupGap + kPopupPadding;

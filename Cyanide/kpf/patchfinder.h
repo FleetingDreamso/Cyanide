@@ -10,7 +10,8 @@
 
 #include <stdio.h>
 
-int grab_kernelcache(void);
+// One-time bring-up of the ksafe mapped-address gate (kernel_map snapshot).
+// Historical name — no kernelcache or XPF involved anymore.
 int init_xpf(void);
 
 #endif /* patchfinder_h */

@@ -648,6 +648,31 @@ static int patch_homescreen_list_models_v3(uint64_t mgr, int cols, int rows)
     return touched;
 }
 
+// iOS 18: force the icon-label switch off for a given icon location via the list
+// layout provider. The home screen (SBIconLocationRoot) is handled inline in
+// patch_homescreen_grid; each OTHER location (notably folders) has its own layout
+// configuration, so the root setShowsLabels: does not reach it — that is why Hide
+// Labels left folder icons labelled. Safe no-op if the location, config, or
+// selector is absent (and on iOS 17, where setShowsLabels: is a no-op — the
+// process-wide _shouldShowLabel swizzle already covers folder icons there).
+static void set_shows_labels_off_for_location(uint64_t provider, const char *locName)
+{
+    if (!provider || !locName) return;
+    uint64_t loc = r_cfstr(locName);
+    if (!loc || !r_responds(provider, "layoutForIconLocation:")) return;
+    uint64_t layout = r_msg2(provider, "layoutForIconLocation:", loc, 0, 0, 0);
+    if (!layout) { printf("[SBC] labels: no layout for %s\n", locName); return; }
+    usleep(50000);
+    uint64_t cfg = try_msg0(layout, "layoutConfiguration");
+    if (!r_is_objc_ptr(cfg) || !r_responds(cfg, "setShowsLabels:")) {
+        printf("[SBC] labels: %s cfg lacks setShowsLabels:\n", locName);
+        return;
+    }
+    usleep(50000);
+    r_msg2(cfg, "setShowsLabels:", 0, 0, 0, 0);
+    printf("[SBC] labels: showsLabels=NO for %s\n", locName);
+}
+
 static void patch_homescreen_grid(uint64_t iconCtrl, int cols, int rows, bool hideLabels)
 {
     uint64_t mgr = try_msg0(iconCtrl, "iconManager");
@@ -695,6 +720,12 @@ static void patch_homescreen_grid(uint64_t iconCtrl, int cols, int rows, bool hi
                     }
                 }
             }
+        }
+
+        // Root (home screen) is done above. Folders have their own layout
+        // configuration, so extend the label switch to the folder location too.
+        if (hideLabels) {
+            set_shows_labels_off_for_location(provider, "SBIconLocationFolder");
         }
     } else {
         printf("[SBC] hs: nil listLayoutProvider\n");

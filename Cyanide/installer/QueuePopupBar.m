@@ -147,8 +147,24 @@
     }
 }
 
+- (void)setSuppressed:(BOOL)suppressed
+{
+    if (_suppressed == suppressed) return;
+    _suppressed = suppressed;
+    if (suppressed) {
+        [self setVisible:NO animated:YES];
+    } else {
+        [self refreshFromQueueAnimated:YES];
+    }
+}
+
 - (void)refreshFromQueueAnimated:(BOOL)animated
 {
+    if (self.suppressed) {
+        [self setVisible:NO animated:animated];
+        return;
+    }
+
     PackageQueue *q = [PackageQueue sharedQueue];
     NSInteger count = q.pendingCount;
 
