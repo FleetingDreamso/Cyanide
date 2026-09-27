@@ -5611,6 +5611,21 @@ void settings_application_did_enter_background(void)
     if (__sync_lock_test_and_set(&g_app_in_background, 1)) return;
     if (settings_cleanup_in_progress()) return;
 
+    // KRW background survival. Under UIScene lifecycle the AppDelegate's
+    // applicationDidEnterBackground: does NOT fire — only this scene hook does —
+    // so the detach that hands the socket fds to launchd (letting the primitive
+    // survive device sleep) never ran when backgrounding without a live tweak.
+    // A suspended app holding live fds loses the socket on sleep (setsockopt
+    // then returns EINVAL/errno 22 and the next run falls back to the full
+    // exploit chain). The idle-park worker's 5 s detach can't cover it: the app
+    // is frozen before it fires. Detach here instead, but only when no live
+    // tweak needs the session in-process — those keep the primitive in-process
+    // by design (settings_krw_idle_detach_allowed() encodes exactly that gate).
+    // On return, the next kernel access re-makes the fds from launchd.
+    if (settings_krw_idle_detach_allowed()) {
+        settings_detach_krw_for_background();
+    }
+
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     BOOL themerLiveNeeded =
         !settings_themer_dynamic_updates_blocked_by_stage(d) &&
