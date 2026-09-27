@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <mach/mach_time.h>
 #include <mach/thread_info.h>
+#include <mach/task_policy.h>
 #include <mach/vm_page_size.h>
 #include "kutils.h"
 
@@ -236,6 +237,127 @@ int procmgr_suspend_count(int pid) {
     }
     krw_set_nonfatal(false);
     return rc;
+}
+
+// --- task category role (foreground / background app vs daemon) -------------
+// The Mach task-category role (TASK_FOREGROUND_APPLICATION, ...) lives in a
+// packed bitfield inside struct task's policy. CocoaTop reads it with
+// task_policy_get(TASK_CATEGORY_POLICY), which needs a task port we don't have
+// for other processes — but we can read it out of the task struct via KRW once
+// we know where the field is. Locate it by perturbation: we CAN read and set
+// our OWN role (task_policy_get/set on mach_task_self), so flip our role, see
+// which nibble of our task struct moved, and restore it. Cosmetic feature — a
+// wrong or absent calibration only mislabels rows, never crashes (read-only).
+static bool     g_pm_role_cal   = false;
+static uint32_t g_pm_off_role   = 0;   // byte offset of the uint64 holding the role
+static uint32_t g_pm_role_shift = 0;   // bit position of the role field
+static uint64_t g_pm_role_mask  = 0;   // field mask (0x7 or 0xF)
+
+static bool pm_self_role_get(int *out) {
+    task_category_policy_data_t pol; memset(&pol, 0, sizeof(pol));
+    mach_msg_type_number_t cnt = TASK_CATEGORY_POLICY_COUNT;
+    boolean_t def = FALSE;
+    if (task_policy_get(mach_task_self(), TASK_CATEGORY_POLICY,
+                        (task_policy_t)&pol, &cnt, &def) != KERN_SUCCESS)
+        return false;
+    *out = pol.role;
+    return true;
+}
+
+static bool pm_self_role_set(int role) {
+    task_category_policy_data_t pol; memset(&pol, 0, sizeof(pol));
+    pol.role = role;
+    return task_policy_set(mach_task_self(), TASK_CATEGORY_POLICY,
+                           (task_policy_t)&pol, TASK_CATEGORY_POLICY_COUNT) == KERN_SUCCESS;
+}
+
+static void pm_calibrate_task_role(void) {
+    if (g_pm_role_cal) return;
+    if (!kexploit_krw_ready()) return;
+
+    int r0 = 0;
+    if (!pm_self_role_get(&r0)) return;
+
+    krw_set_nonfatal(true);
+    uint64_t task = proc_task(proc_self());
+    uint32_t cap = procmgr_is_kern_ptr(task) ? pm_scan_cap(task, 0xC00) : 0;
+    if (cap < 0x10 + 8) { krw_set_nonfatal(false); return; }
+
+    uint8_t before[0xC00], after[0xC00], restored[0xC00];
+    kreadbuf(task, before, cap);
+
+    // Flip to a distinct role, snapshot, restore, snapshot again. Foreground(1)
+    // <-> Background(2): both fit any plausible field width and are a clean +/-1
+    // nibble move. The scheduler blip is sub-millisecond and restored at once.
+    int alt = (r0 == TASK_BACKGROUND_APPLICATION) ? TASK_FOREGROUND_APPLICATION
+                                                  : TASK_BACKGROUND_APPLICATION;
+    int rr = 0;
+    bool flipped = pm_self_role_set(alt) && pm_self_role_get(&rr) && rr == alt;
+    kreadbuf(task, after, cap);
+    pm_self_role_set(r0);              // restore our real role
+    kreadbuf(task, restored, cap);
+    krw_set_nonfatal(false);
+    if (!flipped) {
+        printf("[PROCMGR] task role calib: own role would not change (r0=%d)\n", r0);
+        return;
+    }
+
+    // Find the uint64 field that went r0 -> alt -> r0 and, within that same
+    // uint64, changed ONLY in that field. The three-way constraint makes a
+    // coincidental match extremely unlikely; require uniqueness to be safe.
+    uint32_t foundOff = 0, foundShift = 0; uint64_t foundMask = 0; int matches = 0;
+    for (uint32_t off = 0x8; off + 8 <= cap; off += 8) {
+        uint64_t ov, nv, rv;
+        memcpy(&ov, before + off, 8);
+        memcpy(&nv, after + off, 8);
+        memcpy(&rv, restored + off, 8);
+        if (ov == nv) continue;
+        for (uint32_t shift = 0; shift <= 60; shift++) {
+            for (int mb = 3; mb <= 4; mb++) {
+                uint64_t mask = (1ULL << mb) - 1;
+                if (((ov >> shift) & mask) != (uint64_t)r0)  continue;
+                if (((nv >> shift) & mask) != (uint64_t)alt) continue;
+                if (((rv >> shift) & mask) != (uint64_t)r0)  continue;
+                // Only this field may account for the before->after delta.
+                if (((ov ^ nv) & ~(mask << shift)) != 0) continue;
+                foundOff = off; foundShift = shift; foundMask = mask; matches++;
+            }
+        }
+    }
+    if (matches == 1) {
+        g_pm_off_role = foundOff; g_pm_role_shift = foundShift; g_pm_role_mask = foundMask;
+        g_pm_role_cal = true;
+        printf("[PROCMGR] task role calibrated: off=+0x%x shift=%u mask=0x%llx (self=%d)\n",
+               foundOff, foundShift, (unsigned long long)foundMask, r0);
+    } else {
+        printf("[PROCMGR] task role calibration failed (matches=%d)\n", matches);
+    }
+}
+
+// Mach task-category role for pid (TASK_FOREGROUND_APPLICATION=1,
+// TASK_BACKGROUND_APPLICATION=2, TASK_UNSPECIFIED=0, ...). -1 when
+// uncalibrated/unavailable. Read-only.
+int procmgr_task_role(int pid) {
+    if (!g_pm_role_cal) return -1;
+    if (!kexploit_krw_ready()) return -1;
+    krw_set_nonfatal(true);
+    int role = -1;
+    uint64_t proc = proc_find(pid);
+    if (procmgr_is_kern_ptr(proc)) {
+        uint64_t task = proc_task(proc);
+        if (procmgr_is_kern_ptr(task)) {
+            uint64_t v = kread64(task + g_pm_off_role);
+            role = (int)((v >> g_pm_role_shift) & g_pm_role_mask);
+        }
+    }
+    krw_set_nonfatal(false);
+    return role;
+}
+
+bool procmgr_role_is_foreground(int role) { return role == TASK_FOREGROUND_APPLICATION; }
+bool procmgr_role_is_switcher(int role)   { return role == TASK_BACKGROUND_APPLICATION; }
+bool procmgr_role_is_app(int role) {
+    return role == TASK_FOREGROUND_APPLICATION || role == TASK_BACKGROUND_APPLICATION;
 }
 
 // Read one proc's pid+name into an entry. Returns false if the proc looks bogus.
@@ -1463,6 +1585,10 @@ int procmgr_calibrate(void) {
     // reset would otherwise silently end the window the stages below rely on).
     if (!g_pm_off_task_suspcount)
         pm_calibrate_suspcount();
+    // App-switcher marking: locate the task category-role field once (its own
+    // nonfatal window). Read-only afterward; failure just leaves rows unmarked.
+    if (!g_pm_role_cal)
+        pm_calibrate_task_role();
 
     // Nonfatal for the whole calibration: this runs on a UI background queue
     // and a transient KRW hiccup (idle-detach race, reattach failure) must

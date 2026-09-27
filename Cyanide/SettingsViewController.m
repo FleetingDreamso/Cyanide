@@ -8142,7 +8142,16 @@ static NSString *pm_chip_name(NSString *machine) {
             // Kernel-side suspend_count is the reliable signal; libproc p_stat
             // (PM_SSTOP/PM_SZOMB) is kept as a fallback.
             int st = procmgr_pstat(pid);
-            if (st == PM_SSTOP || st == PM_SZOMB || procmgr_suspend_count(pid) > 0)
+            BOOL suspended = (st == PM_SSTOP || st == PM_SZOMB || procmgr_suspend_count(pid) > 0);
+            // Mach task role marks GUI apps (like CocoaTop): foreground = the
+            // frontmost app, switcher = a backgrounded UI app in the app
+            // switcher. A GUI app is a real, user-facing process the user may
+            // want to quit, so it is NOT treated as an inert "suspended" row
+            // even while iOS has it task-suspended in the background.
+            int role = procmgr_task_role(pid);
+            if (procmgr_role_is_foreground(role))     row[@"approle"] = @"foreground";
+            else if (procmgr_role_is_switcher(role))  row[@"approle"] = @"switcher";
+            if (suspended && !procmgr_role_is_app(role))
                 row[@"suspended"] = @YES;
             [rows addObject:row];
         }
@@ -8321,8 +8330,20 @@ static NSString *pm_chip_name(NSString *machine) {
     cell.nameL.textColor = suspended ? [UIColor tertiaryLabelColor]
                            : protectedPid ? [UIColor secondaryLabelColor]
                                           : [UIColor labelColor];
-    cell.pidL.text = suspended ? [NSString stringWithFormat:@"PID %d · suspended", pid]
-                               : [NSString stringWithFormat:@"PID %d", pid];
+    NSString *approle = p[@"approle"];   // "foreground" / "switcher" / nil
+    if (suspended) {
+        cell.pidL.text = [NSString stringWithFormat:@"PID %d · suspended", pid];
+        cell.pidL.textColor = [UIColor tertiaryLabelColor];
+    } else if ([approle isEqualToString:@"foreground"]) {
+        cell.pidL.text = [NSString stringWithFormat:@"PID %d · foreground app", pid];
+        cell.pidL.textColor = [UIColor systemBlueColor];
+    } else if ([approle isEqualToString:@"switcher"]) {
+        cell.pidL.text = [NSString stringWithFormat:@"PID %d · app switcher", pid];
+        cell.pidL.textColor = [UIColor systemTealColor];
+    } else {
+        cell.pidL.text = [NSString stringWithFormat:@"PID %d", pid];
+        cell.pidL.textColor = [UIColor secondaryLabelColor];   // reset for cell reuse
+    }
 
     NSNumber *mem = p[@"mem"];
     cell.memL.text = mem ? [NSByteCountFormatter stringFromByteCount:(long long)mem.unsignedLongLongValue

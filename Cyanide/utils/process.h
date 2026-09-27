@@ -61,6 +61,17 @@ int procmgr_pstat(int pid);
 // iOS-preloaded or background-suspended apps). Read-only.
 int procmgr_suspend_count(int pid);
 
+// Mach task-category role for pid: TASK_UNSPECIFIED(0) for daemons,
+// TASK_FOREGROUND_APPLICATION(1) for the frontmost UI app,
+// TASK_BACKGROUND_APPLICATION(2) for a backgrounded UI app (i.e. in the app
+// switcher), and so on. -1 when uncalibrated/unavailable. Read-only; the field
+// offset is self-calibrated by flipping our own role once and seeing which
+// task-struct nibble moves. Same GUI-app signal CocoaTop shows.
+int procmgr_task_role(int pid);
+bool procmgr_role_is_foreground(int role);  // frontmost UI app
+bool procmgr_role_is_switcher(int role);    // backgrounded UI app (in switcher)
+bool procmgr_role_is_app(int role);         // either of the above (a GUI app)
+
 // Force-quit a process by pid via thread saved-state corruption (KRW). Returns
 // 0 on success; negative on refusal/error:
 //   -1 protected pid (0/1)  -2 KRW not ready  -3 proc not found
