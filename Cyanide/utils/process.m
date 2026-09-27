@@ -149,7 +149,7 @@ static void pm_calibrate_suspcount(void) {
     if (g_pm_off_task_suspcount) return;
     if (!kexploit_krw_ready()) return;
 
-    uint32_t nSelf = 0, nLaunchd = 0;
+    uint32_t nSelf = 0;
     if (!pm_taskinfo_threadnum(getpid(), &nSelf)) {
         printf("[PROCMGR] suspend_count calib: own threadnum unavailable\n");
         return;
@@ -166,34 +166,55 @@ static void pm_calibrate_suspcount(void) {
     uint8_t tb[0x800];
     kreadbuf(task, tb, cap);
 
-    // Reference: launchd is always running with suspend_count == 0.
+    // Cross-check against launchd (pid 1), read DIRECTLY via KRW.
+    //
+    // We deliberately do NOT use proc_pidinfo(1) for the reference thread count:
+    // the app sandbox blocks task-info on other processes, so that path failed
+    // every pass on device ("launchd reference unavailable") and suspend_count
+    // never calibrated — which is why preloaded/suspended apps (p_stat stays
+    // SRUN) were never dimmed. Instead we validate the candidate offset against
+    // launchd's own task struct fields: launchd always has a plausible
+    // thread_count, an active count close to it, and suspend_count == 0 (it is
+    // never suspended). That needs only kernel reads, which work.
     uint64_t lproc = proc_find(1);
     uint64_t ltask = procmgr_is_kern_ptr(lproc) ? proc_task(lproc) : 0;
-    bool haveLaunchd = procmgr_is_kern_ptr(ltask) &&
-                       pm_taskinfo_threadnum(1, &nLaunchd);
+    uint32_t lcap  = procmgr_is_kern_ptr(ltask) ? pm_scan_cap(ltask, 0x800) : 0;
+    bool haveLaunchd = procmgr_is_kern_ptr(ltask) && lcap >= 0x40 + 12;
 
+    // Require a UNIQUE candidate: the layout is three consecutive int32
+    //   thread_count == nSelf, active_thread_count ~= nSelf, suspend_count == 0
+    // which is specific, but if more than one offset fits we cannot tell which
+    // is really suspend_count, so we defer rather than guess wrong.
     uint32_t found = 0;
-    for (uint32_t off = 0x40; off + 12 <= cap && !found; off += 4) {
+    int matches = 0;
+    for (uint32_t off = 0x40; off + 12 <= cap; off += 4) {
         if (*(uint32_t *)(tb + off) != nSelf) continue;          // thread_count
         uint32_t act = *(uint32_t *)(tb + off + 4);              // active_thread_count
         uint32_t lo = nSelf > 2 ? nSelf - 2 : 1;
         if (act < lo || act > nSelf) continue;
-        if (*(uint32_t *)(tb + off + 8) != 0) continue;          // our suspend_count
-        if (haveLaunchd) {
-            if (kread32(ltask + off) != nLaunchd) continue;
-            if (kread32(ltask + off + 8) != 0) continue;
-            found = off;
+        if (*(uint32_t *)(tb + off + 8) != 0) continue;          // our suspend_count == 0
+
+        if (haveLaunchd && off + 12 <= lcap) {
+            uint32_t ltc  = kread32(ltask + off);                // launchd thread_count
+            uint32_t lact = kread32(ltask + off + 4);            // launchd active count
+            uint32_t lsc  = kread32(ltask + off + 8);            // launchd suspend_count
+            if (ltc < 1 || ltc > 4096) continue;                 // implausible
+            uint32_t llo = ltc > 4 ? ltc - 4 : 1;
+            if (lact < llo || lact > ltc) continue;              // active near total
+            if (lsc != 0) continue;                              // launchd never suspended
         }
+        matches++;
+        found = off;
     }
     krw_set_nonfatal(false);
 
-    if (found) {
+    if (found && matches == 1) {
         g_pm_off_task_suspcount = found + 8;
-        printf("[PROCMGR] suspend_count calibrated: task=+0x%x\n",
-               g_pm_off_task_suspcount);
+        printf("[PROCMGR] suspend_count calibrated: task=+0x%x (launchd xcheck=%d)\n",
+               g_pm_off_task_suspcount, haveLaunchd ? 1 : 0);
     } else {
-        printf("[PROCMGR] suspend_count calibration failed this pass%s\n",
-               haveLaunchd ? "" : " (launchd reference unavailable)");
+        printf("[PROCMGR] suspend_count calibration failed this pass (matches=%d launchd=%d)\n",
+               matches, haveLaunchd ? 1 : 0);
     }
 }
 
