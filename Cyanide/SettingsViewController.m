@@ -7993,7 +7993,13 @@ static NSString *pm_chip_name(NSString *machine) {
 
     // Auto-arm on open: armKRW tries the parked-primitive restore first (safe,
     // no confirmation) and only asks before running the full exploit.
-    if (!self.krwReady && !self.arming) [self armKRW];
+    if (!self.krwReady && !self.arming) {
+        [self armKRW];
+    } else if (self.krwReady) {
+        // Returning to the viewer (e.g. after opening another app): refresh so
+        // newly-launched processes appear instead of showing a stale snapshot.
+        [self reloadProcs];
+    }
 }
 
 - (void)viewWillDisappear:(BOOL)animated
@@ -8200,7 +8206,18 @@ static NSString *pm_chip_name(NSString *machine) {
 - (void)updateSearchResultsForSearchController:(UISearchController *)searchController
 {
     self.filter = searchController.searchBar.text ?: @"";
-    if (self.krwReady) [self applyFilter];
+    if (!self.krwReady) return;
+    [self applyFilter];   // filter the existing snapshot immediately (cheap)
+
+    // Also refresh the underlying process snapshot while searching, so an app
+    // launched after the viewer opened shows up in the results. Throttled so we
+    // don't re-walk the whole proc list on every keystroke.
+    static uint64_t lastSearchReloadNs = 0;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now - lastSearchReloadNs > 800ULL * NSEC_PER_MSEC) {
+        lastSearchReloadNs = now;
+        [self reloadProcs];
+    }
 }
 
 #pragma mark Arming
@@ -8398,48 +8415,92 @@ static NSString *pm_chip_name(NSString *machine) {
     [ac addAction:[UIAlertAction actionWithTitle:@"Force Quit"
                                            style:UIAlertActionStyleDestructive
                                          handler:^(UIAlertAction *a) {
-        int rc = procmgr_kill(pid);
-        if (rc != 0) {
-            NSString *msg;
-            switch (rc) {
-                case -3:
-                    msg = @"The process has already exited.";
-                    break;
-                case -6:
-                    msg = @"The system denied the force-quit signal for this process, and forcing it any other way isn't safe (it can panic the device), so it's left running.";
-                    break;
-                default:
-                    msg = [NSString stringWithFormat:@"Error %d (the process may have already exited).", rc];
-                    break;
-            }
-            UIAlertController *err = [UIAlertController
-                alertControllerWithTitle:@"Couldn't Force Quit"
-                                 message:msg
-                          preferredStyle:UIAlertControllerStyleAlert];
-            [err addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-            [self presentViewController:err animated:YES completion:nil];
-            return;
-        }
-        // Verify: the kill only lands when a thread returns to user mode, so a
-        // process idle in the kernel may survive. Check after a moment and say so
-        // honestly instead of silently leaving it in the list.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            BOOL alive = procmgr_pid_alive(pid);
+        // Run off-main: a plain SIGKILL is instant, but the launchd fallback
+        // sets up a remote call (thread hijack) that must not block the UI.
+        // Pause the KRW poll while we do it so the two don't contend.
+        [self stopAutoRefreshTimer];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            int rc = procmgr_kill(pid);
+            // -6 == our own SIGKILL was denied (the app sandbox blocks signalling
+            // other apps). Kill it from launchd instead: launchd is root and
+            // unsandboxed, so kill(pid, SIGKILL) run inside it lands on any
+            // process. This is a clean syscall from a privileged context — no
+            // memory corruption, so none of the crash-trick's panic risk.
+            if (rc == -6)
+                rc = [self pmForceKillViaLaunchd:pid];
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (alive) {
-                    UIAlertController *nope = [UIAlertController
-                        alertControllerWithTitle:@"Didn't terminate"
-                                         message:[NSString stringWithFormat:@"%@ (PID %d) is still running — it's idle in the kernel, which force-quit can't reach without a kernel signal.", name, pid]
+                [self startAutoRefreshTimerIfNeeded];
+                if (rc != 0) {
+                    NSString *msg;
+                    switch (rc) {
+                        case -3:
+                            msg = @"The process has already exited.";
+                            break;
+                        case -6:
+                            msg = @"The system denied the force-quit signal, and killing it from launchd didn't take either, so it's left running.";
+                            break;
+                        default:
+                            msg = [NSString stringWithFormat:@"Error %d (the process may have already exited).", rc];
+                            break;
+                    }
+                    UIAlertController *err = [UIAlertController
+                        alertControllerWithTitle:@"Couldn't Force Quit"
+                                         message:msg
                                   preferredStyle:UIAlertControllerStyleAlert];
-                    [nope addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                    [self presentViewController:nope animated:YES completion:nil];
+                    [err addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                    [self presentViewController:err animated:YES completion:nil];
+                    return;
                 }
-                [self reloadProcs];
+                // Verify termination after a moment and say so honestly instead
+                // of silently leaving it in the list.
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                               dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    BOOL alive = procmgr_pid_alive(pid);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if (alive) {
+                            UIAlertController *nope = [UIAlertController
+                                alertControllerWithTitle:@"Didn't terminate"
+                                                 message:[NSString stringWithFormat:@"%@ (PID %d) is still running.", name, pid]
+                                          preferredStyle:UIAlertControllerStyleAlert];
+                            [nope addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                            [self presentViewController:nope animated:YES completion:nil];
+                        }
+                        [self reloadProcs];
+                    });
+                });
             });
         });
     }]];
     [self presentViewController:ac animated:YES completion:nil];
+}
+
+// Force-quit a process that our own SIGKILL can't reach (the app sandbox blocks
+// signalling other apps). Run kill(pid, SIGKILL) *inside launchd* — pid 1 is
+// root and unsandboxed, so it can signal anything. A scoped RemoteCallSession
+// keeps its own private remote-call state, so this never disturbs a live
+// SpringBoard tweak session sharing the default state. Returns 0 on success,
+// negative otherwise. Must be called off the main thread (it hijacks a launchd
+// thread). NOTE: no memory corruption anywhere — a clean privileged syscall, so
+// none of the old saved-state crash-trick's panic risk.
+- (int)pmForceKillViaLaunchd:(int)pid
+{
+    if (pid <= 1) return -1;
+    if (!kexploit_krw_ready()) return -2;
+
+    RemoteCallSession *s = [[RemoteCallSession alloc] initWithProcess:@"launchd"
+                                                  useMigFilterBypass:NO];
+    if (!s) {
+        printf("[PROCMGR] launchd kill: could not open remote-call session\n");
+        return -7;
+    }
+    uint64_t r = [s doRemoteCallStableWithTimeout:2000
+                                     functionName:"kill"
+                                               x0:(uint64_t)pid
+                                               x1:(uint64_t)SIGKILL
+                                               x2:0 x3:0 x4:0 x5:0 x6:0 x7:0];
+    printf("[PROCMGR] launchd kill(%d, SIGKILL) returned %d\n", pid, (int)r);
+    // kill() returns 0 on success, -1 on failure.
+    return ((int)r == 0) ? 0 : -8;
 }
 
 @end

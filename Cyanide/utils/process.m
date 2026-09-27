@@ -1479,9 +1479,21 @@ int procmgr_calibrate(void) {
         printf("[PROCMGR] bring-up done; ksafe_available=%d\n", ksafe_available());
     }
 
-    if (pm_load_cache())
-        printf("[PROCMGR] calibration loaded from cache (thr=%d cpu=%d mem=%d)\n",
-               g_pm_thr_cal, g_pm_cpu_cal, g_pm_mem_cal);
+    // Log the cache-load ONCE, not every poll. procmgr_calibrate() runs on
+    // every process-viewer refresh; a per-poll log line here is one write every
+    // couple of seconds, and each write trips the logger's F_FULLFSYNC — on APFS
+    // that commits a full journal transaction, so a single steady-state line
+    // amplifies into ~1 GB of disk writes over a long session and can trip a
+    // silent disk-writes resource kill (no crash .ips, KRW left un-parked). The
+    // steady-state poll must produce zero log writes.
+    if (pm_load_cache()) {
+        static bool loggedCacheLoad = false;
+        if (!loggedCacheLoad) {
+            loggedCacheLoad = true;
+            printf("[PROCMGR] calibration loaded from cache (thr=%d cpu=%d mem=%d)\n",
+                   g_pm_thr_cal, g_pm_cpu_cal, g_pm_mem_cal);
+        }
+    }
 
     // Don't trust the cache blindly: replay it against our own process and
     // drop whatever doesn't reproduce the userspace truth. Cleared flags are
