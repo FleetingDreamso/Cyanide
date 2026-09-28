@@ -8292,7 +8292,15 @@ static NSString *pm_chip_name(NSString *machine) {
     [self.tableView reloadData];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        BOOL ok = (kexploit_opa334_recover_only() == 0) || kexploit_krw_ready();
+        // Recover parked KRW via the shared helper, NOT kexploit_opa334_recover_only()
+        // directly: the shared path sets g_kexploit_done (and notifies state). Without
+        // it, g_kexploit_done stayed NO for a viewer session, and
+        // settings_detach_krw_for_background() then silently returned at its
+        // `if (!g_kexploit_done) return;` guard — so the primitive was NEVER handed
+        // to launchd before the app suspended and the socket died (errno 22 on wake).
+        // This is why tweak runs (which go through settings_ensure_kexploit) survived
+        // sleep but the Process Viewer did not.
+        BOOL ok = settings_ensure_kexploit_for_read() || kexploit_krw_ready();
         dispatch_async(dispatch_get_main_queue(), ^{
             if (ok && kexploit_krw_ready()) {
                 self.arming = NO;
@@ -8317,7 +8325,7 @@ static NSString *pm_chip_name(NSString *machine) {
                 UINavigationController *lnav = [[UINavigationController alloc] initWithRootViewController:log];
                 [self presentViewController:lnav animated:YES completion:^{
                     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        kexploit_opa334();
+                        settings_ensure_kexploit();   // sets g_kexploit_done on success
                         dispatch_async(dispatch_get_main_queue(), ^{
                             self.arming = NO;
                             if (self.presentedViewController == lnav) {
