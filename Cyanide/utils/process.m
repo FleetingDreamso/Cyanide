@@ -249,6 +249,7 @@ int procmgr_suspend_count(int pid) {
 // which nibble of our task struct moved, and restore it. Cosmetic feature — a
 // wrong or absent calibration only mislabels rows, never crashes (read-only).
 static bool     g_pm_role_cal   = false;
+static bool     g_pm_role_tried = false; // calibration attempted (once per session)
 static uint32_t g_pm_off_role   = 0;   // byte offset of the uint64 holding the role
 static uint32_t g_pm_role_shift = 0;   // bit position of the role field
 static uint64_t g_pm_role_mask  = 0;   // field mask (0x7 or 0xF)
@@ -272,8 +273,17 @@ static bool pm_self_role_set(int role) {
 }
 
 static void pm_calibrate_task_role(void) {
-    if (g_pm_role_cal) return;
+    if (g_pm_role_cal || g_pm_role_tried) return;
     if (!kexploit_krw_ready()) return;
+
+    // Attempt calibration AT MOST ONCE per session. It relies on flipping our
+    // own task role, but iOS does not let an app change its own category role
+    // (task_policy_set is a no-op), so on device the perturbation never takes
+    // and calibration fails. Without this one-shot guard the failure retried on
+    // every process-viewer poll — spamming the log every 2 s (re-creating the
+    // F_FULLFSYNC disk-write pressure) and firing a useless task_policy_set each
+    // time. One try, then give up quietly for the rest of the session.
+    g_pm_role_tried = true;
 
     int r0 = 0;
     if (!pm_self_role_get(&r0)) return;

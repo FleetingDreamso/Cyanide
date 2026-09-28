@@ -2051,14 +2051,22 @@ static void settings_krw_follow_screen_transition(void)
 
     int now = settings_screen_awake_cached() ? 1 : 0;
     int prev = __sync_lock_test_and_set(&prevAwake, now);
-    if (prev == now || prev < 0) return;   // no transition, or first observation
+    if (prev == now) return;   // no transition
 
     if (now == 0) {
+        // Screen asleep: detach to launchd so the primitive survives screen-off.
+        // Do this even on the FIRST observation (prev < 0): if the very first
+        // screen event of a session is a blank, a suspended app still holding
+        // live socket fds loses the primitive (setsockopt then returns EINVAL on
+        // wake). detach is idempotent, so acting on an unknown prior state is
+        // safe — the old `prev < 0` bail left exactly this first sleep unguarded.
         dispatch_async(q, ^{
             if (settings_screen_awake_cached()) return;   // woke again before we ran
             settings_detach_krw_for_background();
         });
-    } else {
+    } else if (prev == 0) {
+        // Screen awake after a sleep we saw. (A no-op today; the next kernel
+        // access re-makes the fds. Skipped on first observation.)
         settings_reattach_krw_for_foreground();
     }
 }
@@ -8085,6 +8093,17 @@ static NSString *pm_chip_name(NSString *machine) {
 
 - (void)reloadProcs
 {
+    // Don't poll KRW while the screen is off. The auto-refresh timer keeps firing
+    // even with the screen blanked, and each poll's kernel access re-arms the
+    // socket in-process — which keeps the idle-detach from ever handing it to
+    // launchd. The app then suspends still holding live fds and the socket dies
+    // (setsockopt EINVAL / errno 22 on wake → can't recover the parked state).
+    // Skipping the poll lets KRW go quiet so the idle worker (and the
+    // screen-blank detach) park it in launchd, where it survives screen-off.
+    if (!settings_screen_awake_cached()) {
+        [self.refreshControl endRefreshing];
+        return;
+    }
     if (!kexploit_krw_ready()) {
         self.krwReady = NO;
         self.allProcs = @[];
