@@ -8193,6 +8193,17 @@ static NSString *pm_chip_name(NSString *machine) {
             [rows addObject:row];
         }
         if (buf) free(buf);
+        // Park the filter immediately after the reads. Every KRW read leaves the
+        // socket's in6p_icmp6filt pointing at the last kernel address touched
+        // (here, some process's task struct). Left that way between refreshes, a
+        // sudden suspend parks nothing and the socket can die pointing at freed
+        // memory. Parking now returns it to a safe, permanently-mapped target so
+        // the primitive is in a clean state within the 2 s gap, not only 1 s
+        // after the idle worker notices — closing the window the viewer's steady
+        // polling otherwise leaves open. (Detach-before-suspend still does the
+        // real save; this just keeps the resting state safe in between.)
+        if (kexploit_krw_session_active() && !kexploit_krw_sockets_detached())
+            kexploit_krw_park_filter_safe();
         [rows sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
             return [a[@"pid"] compare:b[@"pid"]];
         }];
