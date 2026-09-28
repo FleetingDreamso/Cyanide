@@ -474,6 +474,14 @@ static bool     g_pm_cpu_cal = false;
 static uint32_t g_pm_off_task_cpu_u = 0;    // task -> total_user_time (terminated threads)
 static uint32_t g_pm_off_task_cpu_s = 0;    // task -> total_system_time
 static bool     g_pm_cpu_abstime = false;   // task counters are mach-abstime (need ns convert)
+// Stop retrying CPU calibration once it has clearly failed. It never succeeds
+// on some devices, and pm_calibrate_task_totals is expensive (vm_allocate
+// perturbation + pthread_create); retrying it 3x on EVERY poll pins the CPU and
+// pounds KRW, which (racing a background detach) helped kill the parked socket.
+// After this many failed passes, give up for the session — CPU column shows "—".
+static int      g_pm_cpu_fail_passes = 0;
+static bool     g_pm_cpu_gaveup = false;
+#define PM_CPU_GIVEUP_PASSES 5
 
 static bool     g_pm_thr_cal = false;
 static uint32_t g_pm_off_thread_utime = 0;  // thread -> user_timer.t_sum
@@ -1567,7 +1575,8 @@ int procmgr_calibrate(void) {
     pm_validate_cache();
 
     bool memPossible = ksafe_available();
-    if (g_pm_thr_cal && g_pm_cpu_cal && (g_pm_mem_cal || !memPossible)) {
+    bool cpuDone = g_pm_cpu_cal || g_pm_cpu_gaveup;   // "settled", success or not
+    if (g_pm_thr_cal && cpuDone && (g_pm_mem_cal || !memPossible)) {
         krw_set_nonfatal(false);
         return 1;
     }
@@ -1585,10 +1594,17 @@ int procmgr_calibrate(void) {
 
     // 2) Task totals (terminated-thread counters) matched against
     //    proc_pidinfo minus the live-thread sum, with a deterministic
-    //    dead-thread sample and a perturbation verify.
-    for (int attempt = 0; attempt < 3 && g_pm_thr_cal && !g_pm_cpu_cal; attempt++) {
+    //    dead-thread sample and a perturbation verify. Give up after a few
+    //    failed passes so we stop running this expensive path on every poll.
+    for (int attempt = 0; attempt < 3 && g_pm_thr_cal && !g_pm_cpu_cal && !g_pm_cpu_gaveup; attempt++) {
         if (pm_calibrate_task_totals(task)) break;
         if (attempt < 2) usleep(50000);
+    }
+    if (g_pm_thr_cal && !g_pm_cpu_cal && !g_pm_cpu_gaveup &&
+        ++g_pm_cpu_fail_passes >= PM_CPU_GIVEUP_PASSES) {
+        g_pm_cpu_gaveup = true;
+        printf("[PROCMGR] cpu calibration given up after %d passes — CPU column "
+               "unavailable this session\n", g_pm_cpu_fail_passes);
     }
 
     // 3) Memory (ledger physical footprint) — only with the mapped-check up.

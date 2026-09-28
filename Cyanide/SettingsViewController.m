@@ -8093,14 +8093,16 @@ static NSString *pm_chip_name(NSString *machine) {
 
 - (void)reloadProcs
 {
-    // Don't poll KRW while the screen is off. The auto-refresh timer keeps firing
-    // even with the screen blanked, and each poll's kernel access re-arms the
-    // socket in-process — which keeps the idle-detach from ever handing it to
-    // launchd. The app then suspends still holding live fds and the socket dies
-    // (setsockopt EINVAL / errno 22 on wake → can't recover the parked state).
-    // Skipping the poll lets KRW go quiet so the idle worker (and the
-    // screen-blank detach) park it in launchd, where it survives screen-off.
-    if (!settings_screen_awake_cached()) {
+    // Don't poll KRW while the screen is off OR the app is backgrounded. The
+    // auto-refresh timer keeps firing in both cases (viewWillDisappear does NOT
+    // fire when the app merely backgrounds under UIScene), and each poll's
+    // kernel access re-arms the socket in-process. That both prevents the
+    // idle-detach from handing it to launchd AND, worse, runs heavy calibration
+    // KRW/vm_allocate concurrently with the background detach — a race that left
+    // the parked socket dead (setsockopt EINVAL / errno 22) even after a clean
+    // hand-off to launchd. Going quiet lets the primitive rest in launchd where
+    // it survives, and keeps the poll off the detach's back.
+    if (g_app_in_background != 0 || !settings_screen_awake_cached()) {
         [self.refreshControl endRefreshing];
         return;
     }
@@ -8128,6 +8130,11 @@ static NSString *pm_chip_name(NSString *machine) {
     NSDictionary<NSNumber *, NSNumber *> *prevCpu = self.prevCpu;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        // The app may have backgrounded (or the screen blanked) between the guard
+        // above and this block running. Bail before any KRW work so an in-flight
+        // poll can't race the background detach and re-arm the socket it just
+        // parked in launchd.
+        if (g_app_in_background != 0 || !settings_screen_awake_cached()) return;
         // Read-only route: self-calibrate the kernel-struct offsets from our own
         // process, then read every process's memory from the kernel ledger. No
         // writes anywhere, so none of the 18.5 write mitigations apply.
