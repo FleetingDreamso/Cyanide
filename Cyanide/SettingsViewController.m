@@ -2054,16 +2054,27 @@ static void settings_krw_follow_screen_transition(void)
     if (prev == now) return;   // no transition
 
     if (now == 0) {
-        // Screen asleep: detach to launchd so the primitive survives screen-off.
-        // Do this even on the FIRST observation (prev < 0): if the very first
-        // screen event of a session is a blank, a suspended app still holding
-        // live socket fds loses the primitive (setsockopt then returns EINVAL on
-        // wake). detach is idempotent, so acting on an unknown prior state is
-        // safe — the old `prev < 0` bail left exactly this first sleep unguarded.
-        dispatch_async(q, ^{
-            if (settings_screen_awake_cached()) return;   // woke again before we ran
-            settings_detach_krw_for_background();
-        });
+        // Screen asleep: hand the primitive to launchd BEFORE the app suspends,
+        // so it survives screen-off. Do it even on the FIRST observation
+        // (prev < 0): a suspended app holding live socket fds loses the primitive
+        // (setsockopt EINVAL/errno 22 on wake), and detach is idempotent.
+        //
+        // When NO live tweak holds the session (the Process Viewer case), detach
+        // SYNCHRONOUSLY on this observer callback. The detach is fast then (park
+        // + close, no loops to stop), and a dispatch_async can be left unrun:
+        // iOS suspends the app on screen-lock before the background queue is
+        // scheduled, so the async detach never fires and the socket dies live
+        // in-process (seen in live 2.log: screen asleep 19:00:56 -> nothing ->
+        // errno 22 on wake at 19:03:36). Only when live loops must be stopped
+        // off-main do we defer to the queue.
+        if (settings_krw_idle_detach_allowed()) {
+            settings_detach_krw_for_background();   // synchronous, completes now
+        } else {
+            dispatch_async(q, ^{
+                if (settings_screen_awake_cached()) return;   // woke before we ran
+                settings_detach_krw_for_background();
+            });
+        }
     } else if (prev == 0) {
         // Screen awake after a sleep we saw. (A no-op today; the next kernel
         // access re-makes the fds. Skipped on first observation.)
