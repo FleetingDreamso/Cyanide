@@ -3238,6 +3238,25 @@ BOOL settings_krw_idle_detach_allowed(void)
     return YES;
 }
 
+// True when lazy reattach-from-launchd should be SUPPRESSED: the app is
+// backgrounded or the screen is off, and no live tweak needs KRW there.
+//
+// Without this, a Process Viewer poll that was already in flight when the app
+// backgrounded reattaches the socket ~1 ms after the background detach — then
+// the next transition detaches again, thrashing detach/reattach many times a
+// second. That churn is what leaves the primitive fragile enough to die across
+// a suspend (the tweak flow survives because after ONE session-end detach
+// nothing reattaches until the next run). Suppressing reattach here makes the
+// backgrounded viewer behave like the tweak flow: detach once, rest untouched
+// in launchd, reattach only on the next foreground access. Live tweaks
+// (idle_detach NOT allowed) still reattach — they legitimately use KRW in the
+// background.
+BOOL settings_krw_reattach_suppressed(void)
+{
+    if (!settings_krw_idle_detach_allowed()) return NO;   // a live tweak needs KRW
+    return (g_app_in_background != 0 || g_screen_awake == 0);
+}
+
 // Detach the KRW sockets to launchd on backgrounding so the primitive survives
 // device sleep (a session still held live by a suspended Cyanide dies across
 // sleep; one resting only in launchd's fileports does not). Live loops must be

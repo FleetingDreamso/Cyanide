@@ -46,6 +46,10 @@ void settings_detach_krw_for_background(void);
 // applied tweak is holding the SpringBoard session open. Consulted by the
 // kexploit layer before it parks the primitive in launchd.
 BOOL settings_krw_idle_detach_allowed(void);
+// True when lazy reattach-from-launchd should be suppressed (app backgrounded /
+// screen off and no live tweak needs KRW). Stops the Process Viewer's in-flight
+// poll from thrashing detach/reattach right after a background detach.
+BOOL settings_krw_reattach_suppressed(void);
 void settings_reattach_krw_for_foreground(void);
 
 extern NSString * const kSettingsA18ExploitPath;
