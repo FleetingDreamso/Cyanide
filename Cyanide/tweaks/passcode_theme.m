@@ -23,6 +23,7 @@
 
 #import <errno.h>
 #import <fcntl.h>
+#import <ImageIO/ImageIO.h>
 #import <pthread.h>
 #import <string.h>
 #import <sys/stat.h>
@@ -118,9 +119,23 @@ static void settings_passcode_invalidate_caches(void)
     pthread_mutex_unlock(&g_pt_cache_lock);
 }
 
+// The apply/restore worker runs on a background queue while the panel reads the
+// summary on the main thread, so both sides go through the cache lock: a strong
+// pointer must never be read while it is being replaced. Callers must not hold
+// g_pt_cache_lock when calling this: it is not recursive.
+static void pt_set_summary(NSString *summary)
+{
+    pthread_mutex_lock(&g_pt_cache_lock);
+    g_pt_last_summary = [summary copy];
+    pthread_mutex_unlock(&g_pt_cache_lock);
+}
+
 NSString *settings_passcode_last_result_summary(void)
 {
-    return g_pt_last_summary;
+    pthread_mutex_lock(&g_pt_cache_lock);
+    NSString *summary = g_pt_last_summary;
+    pthread_mutex_unlock(&g_pt_cache_lock);
+    return summary;
 }
 
 #pragma mark - Paths
@@ -371,6 +386,29 @@ static void pt_restore_directory_modes(NSMutableDictionary<NSString *, NSNumber 
     [lockedDirs removeAllObjects];
 }
 
+#pragma mark - Originals discarded flag
+
+static NSString * const kPTOriginalsDiscardedKey = @"PasscodeOriginalsDiscarded";
+
+// Once the saved originals are gone, nothing on this device can prove the
+// keypad art is stock. Persisted so the warning survives a relaunch, and cleared
+// only by importing a backup set, which the user is vouching for.
+static BOOL pt_originals_discarded(void)
+{
+    return [NSUserDefaults.standardUserDefaults boolForKey:kPTOriginalsDiscardedKey];
+}
+
+static void pt_set_originals_discarded(BOOL discarded)
+{
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if (discarded) {
+        [defaults setBool:YES forKey:kPTOriginalsDiscardedKey];
+    } else {
+        [defaults removeObjectForKey:kPTOriginalsDiscardedKey];
+    }
+    [defaults synchronize];
+}
+
 #pragma mark - Sandbox
 
 // The keypad art lives under /var/mobile/Library/Caches, so the same
@@ -399,6 +437,8 @@ static bool pt_prepare_sandbox(void)
         "backboardd",
         "mobilephone",
         "sysdiagnosed",
+        "softwareupdateservicesd",
+        "mobile_installation_proxy",
         "installd",
         NULL,
     };
@@ -585,9 +625,9 @@ typedef NS_ENUM(NSInteger, PTBackupResult) {
 };
 
 // Saves `original` — the caller's copy of the target's current bytes — when no
-// usable backup exists yet. Split from pt_backup_original_if_needed() so a
-// caller that already read the file (the apply snapshot pass) can back up and
-// snapshot from a single read.
+// usable backup exists yet. The caller passes the copy it already read (the
+// apply write pass, or the snapshot pass), so saving an original never costs an
+// extra read of the keypad file.
 static PTBackupResult pt_backup_original_data_if_needed(NSData *original, NSString *targetPath)
 {
     if (original.length == 0 || targetPath.length == 0) return PTBackupResultFailed;
@@ -641,34 +681,7 @@ static PTBackupResult pt_backup_original_data_if_needed(NSData *original, NSStri
     return PTBackupResultOK;
 }
 
-static PTBackupResult pt_backup_original_if_needed(NSString *targetPath)
-{
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSString *backupPath = pt_backup_path(targetPath);
 
-    // Fast path: an existing, non-empty backup means there is nothing to read.
-    if ([fm fileExistsAtPath:backupPath]) {
-        NSDictionary *backupAttrs = [fm attributesOfItemAtPath:backupPath error:nil];
-        if ([backupAttrs[NSFileSize] unsignedLongLongValue] > 0) {
-            return PTBackupResultOK;
-        }
-    }
-
-    if (![fm fileExistsAtPath:targetPath]) {
-        log_user("[PASSCODE] No existing %s to back up; leaving it alone.\n",
-                 targetPath.lastPathComponent.UTF8String);
-        return PTBackupResultNoOriginal;
-    }
-
-    NSData *original = pt_read_file(targetPath);
-    if (original.length == 0) {
-        log_user("[PASSCODE] Could not read the original %s for backup.\n",
-                 targetPath.lastPathComponent.UTF8String);
-        return PTBackupResultFailed;
-    }
-
-    return pt_backup_original_data_if_needed(original, targetPath);
-}
 
 static NSData *pt_backup_data(NSString *targetPath)
 {
@@ -853,7 +866,11 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
     if (skippedOut) *skippedOut = kept;
     if (failedOut) *failedOut = failed;
     if (unrecognizedOut) *unrecognizedOut = unusable;
-    if (added > 0) settings_passcode_invalidate_caches();
+    if (added > 0) {
+        settings_passcode_invalidate_caches();
+        // A backup set the user vouches for is present again.
+        pt_set_originals_discarded(false);
+    }
     log_user("[PASSCODE] Backup import: %lu added, %lu already present, %lu failed, %lu unusable for restore (%llu bytes).\n",
              (unsigned long)added, (unsigned long)kept, (unsigned long)failed,
              (unsigned long)unusable, bytes);
@@ -1010,9 +1027,19 @@ NSUInteger settings_passcode_delete_all_backups(void)
     for (NSString *path in paths) {
         if ([fm removeItemAtPath:path error:nil]) removed++;
     }
-    if (removed > 0) settings_passcode_invalidate_caches();
+    if (removed > 0) {
+        settings_passcode_invalidate_caches();
+        // Nothing on this device can vouch for the keypad art any more, so the
+        // panel treats "no backup" as "the art on disk may already be themed".
+        pt_set_originals_discarded(true);
+    }
     log_user("[PASSCODE] Deleted %lu original backup(s).\n", (unsigned long)removed);
     return removed;
+}
+
+BOOL settings_passcode_originals_were_discarded(void)
+{
+    return pt_originals_discarded();
 }
 
 NSURL *settings_passcode_create_backup_archive(NSError **error, NSUInteger *skippedOut)
@@ -1079,16 +1106,6 @@ static bool pt_apply_one_digit(NSData *data,
                                NSString *targetPath,
                                NSMutableDictionary<NSString *, NSNumber *> *lockedDirs)
 {
-    PTBackupResult backup = pt_backup_original_if_needed(targetPath);
-    if (backup == PTBackupResultFailed) return false;
-    if (backup == PTBackupResultNoOriginal) {
-        // Refusing here keeps the upstream implementation's guarantee: never
-        // write a digit whose original could not be saved first.
-        log_user("[PASSCODE] Skipping %s: no original could be saved for it.\n",
-                 targetPath.lastPathComponent.UTF8String);
-        return false;
-    }
-
     NSData *previous = pt_read_file(targetPath);
     if (previous.length == 0) {
         log_user("[PASSCODE] Could not read the current %s before applying.\n",
@@ -1098,8 +1115,22 @@ static bool pt_apply_one_digit(NSData *data,
 
     // Re-applying the same style after a respring is the common repeat case;
     // when the file already holds the intended bytes there is nothing to write.
+    //
+    // Checked before the backup on purpose: if the saved originals were deleted,
+    // this file already holds this style's art, and filing it as the "original"
+    // would make Restore hand back themed art instead of the stock art.
     if ([previous isEqualToData:data]) {
         return true;
+    }
+
+    // This read is also the backup's copy, so both come from the same bytes.
+    // Refusing when it cannot be saved keeps the upstream guarantee: never write
+    // a digit whose original could not be saved first.
+    PTBackupResult backup = pt_backup_original_data_if_needed(previous, targetPath);
+    if (backup != PTBackupResultOK) {
+        log_user("[PASSCODE] Skipping %s: no original could be saved for it.\n",
+                 targetPath.lastPathComponent.UTF8String);
+        return false;
     }
 
     if (!pt_write_data_to_target(data, targetPath, lockedDirs)) return false;
@@ -1136,9 +1167,13 @@ static const NSUInteger kPTSnapshotBudgetBytes = 64 * 1024 * 1024;
 
 // Reads every target once and returns path -> bytes for a whole-run rollback,
 // saving each original from those same bytes (one read serves both purposes).
-// Paths that cannot be read are left out: pt_apply_one_digit() refuses to write
-// them anyway. Returns nil when the total exceeds the budget.
-static NSDictionary<NSString *, NSData *> *pt_snapshot_and_back_up_targets(NSArray<NSString *> *paths)
+// wantedByPath maps a target to the art this run will write there, so a file
+// that already holds that art is not filed as an original. Paths that cannot be
+// read are left out: pt_apply_one_digit() refuses to write them anyway. Returns
+// nil when the total exceeds the budget.
+static NSDictionary<NSString *, NSData *> *pt_snapshot_and_back_up_targets(
+    NSArray<NSString *> *paths,
+    NSDictionary<NSString *, NSData *> *wantedByPath)
 {
     NSMutableDictionary<NSString *, NSData *> *snapshots = [NSMutableDictionary dictionary];
     NSUInteger total = 0;
@@ -1153,7 +1188,19 @@ static NSDictionary<NSString *, NSData *> *pt_snapshot_and_back_up_targets(NSArr
             return nil;
         }
 
+        // The snapshot is always kept: it is what a rollback must restore.
         snapshots[path] = data;
+
+        // A file that already holds this run's art is not an original — a
+        // previous run wrote it, or the user deleted the saved originals. Filing
+        // it would make Restore hand back themed art as if it were stock.
+        NSData *wanted = wantedByPath[path];
+        if (wanted.length > 0 && [data isEqualToData:wanted]) {
+            printf("[PASSCODE] %s already holds this style's art; not saving it as an original\n",
+                   path.lastPathComponent.UTF8String);
+            continue;
+        }
+
         (void)pt_backup_original_data_if_needed(data, path);
     }
     return snapshots;
@@ -1190,39 +1237,47 @@ static NSUInteger pt_rollback_snapshots(NSDictionary<NSString *, NSData *> *snap
 bool settings_passcode_apply_digits(NSDictionary<NSString *, NSData *> *digits)
 {
     CFTimeInterval startedAt = CFAbsoluteTimeGetCurrent();
-    g_pt_last_summary = nil;
+    pt_set_summary(nil);
     g_pt_backups_written = 0;
     // This run reads and rewrites the keypad cache, so start from the real
     // state rather than from anything the panel cached while browsing.
     settings_passcode_invalidate_caches();
 
     if (digits.count == 0) {
-        g_pt_last_summary = @"No digits to apply.";
+        pt_set_summary(@"No digits to apply.");
         log_user("[PASSCODE] Failed: no digits to apply.\n");
         return false;
     }
 
     if (!kexploit_krw_ready()) {
-        g_pt_last_summary = @"Kernel primitives are not active.";
+        pt_set_summary(@"Kernel primitives are not active.");
         log_user("[PASSCODE] Failed: kernel primitives are not active. Run the chain first.\n");
         return false;
     }
 
-    NSString *basePath = settings_passcode_telephony_base_path();
-    if (basePath.length == 0) {
-        g_pt_last_summary = @"No TelephonyUI keypad cache was found on this device.";
-        log_user("[PASSCODE] Failed: no TelephonyUI keypad cache was found.\n");
+    // Unlock /private/var before probing the cache. With the sandbox still
+    // closed every candidate directory looks absent, so a cold run would fail
+    // with a misleading "no keypad cache found" instead of saying the sandbox
+    // could not be opened.
+    if (!pt_prepare_sandbox()) {
+        pt_set_summary(@"Could not unlock /private/var read/write access.");
+        log_user("[PASSCODE] Failed: /private/var read/write access is still denied.\n");
         return false;
     }
-    if (!pt_prepare_sandbox()) {
-        g_pt_last_summary = @"Could not unlock /private/var read/write access.";
+    // The unlock changes what is readable, so anything scanned before it is stale.
+    settings_passcode_invalidate_caches();
+
+    NSString *basePath = settings_passcode_telephony_base_path();
+    if (basePath.length == 0) {
+        pt_set_summary(@"No TelephonyUI keypad cache was found on this device.");
+        log_user("[PASSCODE] Failed: no TelephonyUI keypad cache was found.\n");
         return false;
     }
 
     NSDictionary<NSString *, NSArray<NSString *> *> *targets =
         settings_passcode_targets_by_digit(basePath);
     if (targets.count == 0) {
-        g_pt_last_summary = @"No keypad digit files were found in the cache.";
+        pt_set_summary(@"No keypad digit files were found in the cache.");
         log_user("[PASSCODE] Failed: no keypad digit files matched in %s.\n",
                  basePath.UTF8String);
         return false;
@@ -1238,12 +1293,17 @@ bool settings_passcode_apply_digits(NSDictionary<NSString *, NSData *> *digits)
     // themed. Each original is saved in the same pass, from the same bytes, so
     // the snapshot costs no extra read.
     NSMutableArray<NSString *> *plannedPaths = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSData *> *plannedArt = [NSMutableDictionary dictionary];
     for (NSString *digit in pt_digits_in_order(digits)) {
         NSData *data = digits[digit];
         if (![data isKindOfClass:NSData.class] || data.length == 0) continue;
-        [plannedPaths addObjectsFromArray:targets[digit] ?: @[]];
+        for (NSString *path in targets[digit] ?: @[]) {
+            [plannedPaths addObject:path];
+            plannedArt[path] = data;
+        }
     }
-    NSDictionary<NSString *, NSData *> *snapshots = pt_snapshot_and_back_up_targets(plannedPaths);
+    NSDictionary<NSString *, NSData *> *snapshots =
+        pt_snapshot_and_back_up_targets(plannedPaths, plannedArt);
 
     NSUInteger applied = 0;
     NSUInteger failed = 0;
@@ -1312,7 +1372,7 @@ bool settings_passcode_apply_digits(NSDictionary<NSString *, NSData *> *digits)
                             (unsigned long)applied,
                             CFAbsoluteTimeGetCurrent() - startedAt,
                             backupNote];
-        g_pt_last_summary = [NSString stringWithFormat:@"Passcode style applied. %@", detail];
+        pt_set_summary([NSString stringWithFormat:@"Passcode style applied. %@", detail]);
         log_user("[OK] Passcode style applied. %s\n", detail.UTF8String);
         return applied > 0;
     }
@@ -1324,7 +1384,7 @@ bool settings_passcode_apply_digits(NSDictionary<NSString *, NSData *> *digits)
         backupNote,
         rollbackNote,
         [details componentsJoinedByString:@", "]];
-    g_pt_last_summary = [NSString stringWithFormat:@"Passcode style did not apply cleanly. %@", detail];
+    pt_set_summary([NSString stringWithFormat:@"Passcode style did not apply cleanly. %@", detail]);
     log_user("[WARN] Passcode style did not apply cleanly. %s\n", detail.UTF8String);
     // A partial apply counts as a failure: this flag drives the completion
     // banner, and a banner reading "Complete" above a summary that lists failed
@@ -1336,32 +1396,41 @@ bool settings_passcode_apply_digits(NSDictionary<NSString *, NSData *> *digits)
 bool settings_passcode_restore_originals(NSString *basePath)
 {
     CFTimeInterval startedAt = CFAbsoluteTimeGetCurrent();
-    g_pt_last_summary = nil;
+    pt_set_summary(nil);
     g_pt_backups_written = 0;
     // Same as apply: work from the real keypad state, not from cache.
     settings_passcode_invalidate_caches();
 
-    if (basePath.length == 0) {
-        g_pt_last_summary = @"No TelephonyUI keypad cache was found on this device.";
-        log_user("[PASSCODE] Failed: no TelephonyUI keypad cache was found.\n");
-        return false;
-    }
-
     if (!kexploit_krw_ready()) {
-        g_pt_last_summary = @"Kernel primitives are not active.";
+        pt_set_summary(@"Kernel primitives are not active.");
         log_user("[PASSCODE] Failed: kernel primitives are not active. Run the chain first.\n");
         return false;
     }
 
+    // Unlock before resolving or probing the cache path, for the same reason as
+    // apply: a closed sandbox makes every candidate directory look absent.
+    // Callers may pass a path they already resolved; an empty argument resolves
+    // here, so this function is correct on its own.
     if (!pt_prepare_sandbox()) {
-        g_pt_last_summary = @"Could not unlock /private/var read/write access.";
+        pt_set_summary(@"Could not unlock /private/var read/write access.");
+        log_user("[PASSCODE] Failed: /private/var read/write access is still denied.\n");
+        return false;
+    }
+    settings_passcode_invalidate_caches();
+
+    if (basePath.length == 0) {
+        basePath = settings_passcode_telephony_base_path();
+    }
+    if (basePath.length == 0) {
+        pt_set_summary(@"No TelephonyUI keypad cache was found on this device.");
+        log_user("[PASSCODE] Failed: no TelephonyUI keypad cache was found.\n");
         return false;
     }
 
     NSDictionary<NSString *, NSArray<NSString *> *> *targets =
         settings_passcode_targets_by_digit(basePath);
     if (targets.count == 0) {
-        g_pt_last_summary = @"No keypad digit files were found in the cache.";
+        pt_set_summary(@"No keypad digit files were found in the cache.");
         log_user("[PASSCODE] Failed: no keypad digit files matched in %s.\n",
                  basePath.UTF8String);
         return false;
@@ -1416,7 +1485,7 @@ bool settings_passcode_restore_originals(NSString *basePath)
     settings_passcode_invalidate_caches();
 
     if (restored == 0 && failed == 0) {
-        g_pt_last_summary = @"No original digit backups were found to restore.";
+        pt_set_summary(@"No original digit backups were found to restore.");
         log_user("[WARN] No original digit backups were found to restore.\n");
         return false;
     }
@@ -1425,7 +1494,7 @@ bool settings_passcode_restore_originals(NSString *basePath)
         NSString *detail = [NSString stringWithFormat:@"%lu file(s) in %.1fs.",
                             (unsigned long)restored,
                             CFAbsoluteTimeGetCurrent() - startedAt];
-        g_pt_last_summary = [NSString stringWithFormat:@"Original digits restored. %@", detail];
+        pt_set_summary([NSString stringWithFormat:@"Original digits restored. %@", detail]);
         log_user("[OK] Original digits restored. %s\n", detail.UTF8String);
         return true;
     }
@@ -1435,7 +1504,7 @@ bool settings_passcode_restore_originals(NSString *basePath)
         (unsigned long)restored, (unsigned long)failed,
         CFAbsoluteTimeGetCurrent() - startedAt,
         [details componentsJoinedByString:@", "]];
-    g_pt_last_summary = [NSString stringWithFormat:@"Originals did not restore cleanly. %@", detail];
+    pt_set_summary([NSString stringWithFormat:@"Originals did not restore cleanly. %@", detail]);
     log_user("[WARN] Originals did not restore cleanly. %s\n", detail.UTF8String);
     // Same rule as apply: a partial restore is reported as a failure, with the
     // per-file detail carried in the summary.
@@ -1570,14 +1639,44 @@ static NSString *pt_digit_path_in_dir(NSString *dir, NSString *digit)
             [digit stringByAppendingString:@".png"]];
 }
 
+// A PNG magic match only proves the header, and UIImage's decode is lazy, so a
+// corrupt body would reach the Lock Screen renderer — the one path that can lock
+// the user out. Draw the image once to force a real pixel decode. The bytes that
+// get written are still the caller's originals.
+static BOOL pt_png_is_renderable(NSData *data)
+{
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    if (!source) return NO;
+
+    CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+    CFRelease(source);
+    if (!image) return NO;
+
+    BOOL ok = NO;
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(NULL, 1, 1, 8, 4, space,
+                                                 kCGImageAlphaPremultipliedLast);
+    if (context) {
+        CGContextDrawImage(context, CGRectMake(0.0, 0.0, 1.0, 1.0), image);
+        ok = YES;
+        CGContextRelease(context);
+    }
+    CGColorSpaceRelease(space);
+    CGImageRelease(image);
+    return ok;
+}
+
 // Keypad art always lands under a .png name, so JPEG imports are re-encoded
-// once here and the library only ever holds true PNGs.
+// once here and the library only ever holds true PNGs. PNG input keeps its
+// original bytes, but only once it has been proven renderable.
 static NSData *pt_normalized_png_data(NSData *data)
 {
     if (data.length < 8) return nil;
 
     static const uint8_t pngMagic[8] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
-    if (memcmp(data.bytes, pngMagic, sizeof(pngMagic)) == 0) return data;
+    if (memcmp(data.bytes, pngMagic, sizeof(pngMagic)) == 0) {
+        return pt_png_is_renderable(data) ? data : nil;
+    }
 
     UIImage *image = [UIImage imageWithData:data];
     return image ? UIImagePNGRepresentation(image) : nil;

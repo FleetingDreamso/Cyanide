@@ -4549,7 +4549,8 @@ BOOL settings_apply_passcode_theme_now(BOOL apply)
         }
 
         if (!apply) {
-            return settings_passcode_restore_originals(settings_passcode_telephony_base_path()) ? YES : NO;
+            // nil: the cache path is resolved inside, after the sandbox is unlocked.
+            return settings_passcode_restore_originals(nil) ? YES : NO;
         }
 
         NSDictionary *theme = settings_passcode_selected_theme();
@@ -11403,6 +11404,12 @@ static const NSInteger kPasscodePreviewRow = 1;
     NSString *message = apply
         ? @"Applies the selected digits to the Lock Screen keypad and verifies every write.\n\nLock and unlock (or respring) afterwards to see the change."
         : @"Writes the saved originals back over the keypad art and verifies each restore.";
+
+    if (apply && settings_passcode_theme_backup_count() == 0 &&
+        settings_passcode_originals_were_discarded()) {
+        message = [message stringByAppendingString:
+            @"\n\nWarning: the saved originals were deleted, so the keypad art on this device cannot be proven to be the stock art. Apply saves whatever is there now as the \"original\", so Restore brings that back instead of the factory art."];
+    }
 
     if (!settings_krw_available_without_exploit()) {
         message = [message stringByAppendingString:

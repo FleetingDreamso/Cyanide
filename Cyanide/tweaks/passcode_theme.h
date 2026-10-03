@@ -84,9 +84,13 @@ NSDictionary<NSString *, NSData *> *settings_passcode_current_digit_images(void)
 // Backs up the first originals into Cyanide's app container, writes each
 // digit's art over every keypad file for that digit, and verifies each write
 // by reading it back. A write that cannot be verified rolls back to the
-// previous art; original backups are never overwritten.
+// previous art; original backups are never overwritten, and a file that already
+// holds the art being written is never filed as an original.
 bool settings_passcode_apply_digits(NSDictionary<NSString *, NSData *> *digits);
-// Writes every backed-up original digit back and verifies each restore.
+// Writes every backed-up original digit back and verifies each restore. Pass nil
+// (or an empty string) to resolve the keypad cache path inside, after
+// /private/var has been unlocked — probing it while the sandbox is still closed
+// makes every candidate directory look absent.
 bool settings_passcode_restore_originals(NSString *basePath);
 
 // ---------------------------------------------------------------------------
@@ -117,8 +121,13 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
 NSURL *settings_passcode_create_backup_archive(NSError **error, NSUInteger *skippedOut);
 
 // Deletes every stored original backup and returns how many were removed.
-// Irreversible: Restore Original Digits has nothing to write back afterwards.
+// Irreversible: Restore Original Digits has nothing to write back afterwards,
+// and the current keypad art can no longer be proven stock — from here on an
+// Apply would file the art already on disk as the "original".
 NSUInteger settings_passcode_delete_all_backups(void);
+// YES once the saved originals have been deleted on this device. The panel uses
+// it to warn before an Apply would treat the current keypad art as stock.
+BOOL settings_passcode_originals_were_discarded(void);
 
 // Human-readable outcome of the last apply/restore for the Settings panel.
 NSString *settings_passcode_last_result_summary(void);
