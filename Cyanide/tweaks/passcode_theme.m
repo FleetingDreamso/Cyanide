@@ -1177,6 +1177,7 @@ static NSDictionary<NSString *, NSData *> *pt_snapshot_and_back_up_targets(
 {
     NSMutableDictionary<NSString *, NSData *> *snapshots = [NSMutableDictionary dictionary];
     NSUInteger total = 0;
+    NSUInteger alreadyThemed = 0;
 
     for (NSString *path in paths) {
         NSData *data = pt_read_file(path);
@@ -1196,12 +1197,18 @@ static NSDictionary<NSString *, NSData *> *pt_snapshot_and_back_up_targets(
         // it would make Restore hand back themed art as if it were stock.
         NSData *wanted = wantedByPath[path];
         if (wanted.length > 0 && [data isEqualToData:wanted]) {
-            printf("[PASSCODE] %s already holds this style's art; not saving it as an original\n",
-                   path.lastPathComponent.UTF8String);
+            alreadyThemed++;
             continue;
         }
 
         (void)pt_backup_original_data_if_needed(data, path);
+    }
+
+    // One line per run, never one per file: this module's printf is mirrored
+    // into the in-app log, and a keypad cache holds dozens of files.
+    if (alreadyThemed > 0) {
+        log_user("[PASSCODE] %lu file(s) already held this style's art and were not saved as originals.\n",
+                 (unsigned long)alreadyThemed);
     }
     return snapshots;
 }
